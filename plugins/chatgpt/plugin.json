@@ -29,7 +29,6 @@
           "Read"
         ],
         "websiteURL": "https://www.comparethecloud.net",
-        "supportURL": "https://www.comparethecloud.net/contact",
         "privacyPolicyURL": "https://www.comparethecloud.net/privacy-policy",
         "termsOfServiceURL": "https://www.comparethecloud.net/terms-and-conditions",
         "defaultPrompt": [
@@ -39,7 +38,6 @@
         ],
         "brandColor": "#1A507B",
         "composerIcon": "./assets/icon.png",
-        "composerIconDark": "./assets/icon-dark.png",
         "logo": "./assets/logo.png",
         "logoDark": "./assets/logo-dark.png"
       },

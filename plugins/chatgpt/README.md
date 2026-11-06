@@ -9,7 +9,7 @@ The requested source cases file was unavailable in this checkout; the cases belo
 ## Portal steps
 
 1. Select the owning organisation and project and complete individual or business identity verification.
-2. Deploy the reviewed server changes separately, set `OPENAI_APPS_CHALLENGE` to the portal token, and verify the public challenge URL.
+2. The server is already deployed with the challenge route. When the portal shows the token, run `npx wrangler secret put OPENAI_APPS_CHALLENGE` in the repo, paste the token, then confirm `https://mcp.comparethecloud.net/.well-known/openai-apps-challenge` returns it as plain text.
 3. Upload the ZIP under the verified developer identity, resolve package and skill findings, connect the MCP server with no authentication, verify its domain, and resolve connection and tool scan findings.
 4. Enter the five positive and three negative cases below, record and supply a publicly accessible video walkthrough, and complete review information and release notes. No reviewer credentials are needed for the public server.
 5. Submit for review, address any findings, and choose when to publish after approval.
