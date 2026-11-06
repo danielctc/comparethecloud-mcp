@@ -92,6 +92,15 @@ it('prints top-level statistics and only the twenty largest categories', async (
   expect(response.content[0].text).toContain('total: 21000'); expect(response.content[0].text).toContain('Category 24: 24');
   expect(response.content[0].text).not.toContain('Category 4: 4');
 });
+it('accepts an author object from www and cites its name', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ items: [{ ...fixtures.search_content.items[0], author: { name: 'CTC Staff', slug: 'ctc-staff' } }, { ...fixtures.search_content.items[0], author: null }] })));
+  const listing = await Effect.runPromise(runTool('search_content', { q: 'cloud' }, context()));
+  expect(listing.isError).toBeUndefined(); expect(listing.content[0].text).toContain('Compare the Cloud, CTC Staff, 2026-11-06');
+  expect(listing.content[0].text).toContain('Compare the Cloud, author not supplied, 2026-11-06');
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ item: { ...fixtures.get_content.item, author: { name: 'CTC Staff', slug: 'ctc-staff' } } })));
+  const fetched = await Effect.runPromise(callTool('fetch', { id: 'article:example' }, context()));
+  expect((fetched.structuredContent.metadata as { author: string }).author).toBe('CTC Staff');
+});
 it('caps article text and cites author, date and URL', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => Response.json({ item: { ...fixtures.get_content.item, text: 'x'.repeat(60001) } })));
   const response = await Effect.runPromise(runTool('get_content', input, context()));

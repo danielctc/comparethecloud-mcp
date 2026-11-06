@@ -31,7 +31,8 @@ export const Stats = Schema.StructWithRest(Schema.Struct({ categories: Schema.Ar
 })) }), [Schema.JsonObject]);
 const ContentFields = {
   type: Schema.Literals(['article', 'news', 'opinion']), slug: Schema.String,
-  title: Schema.String, summary: optionalText, author: optionalText,
+  // www sends an author as { name, slug } for articles and opinions, a plain string or null for news.
+  title: Schema.String, summary: optionalText, author: Schema.optional(Schema.NullOr(Schema.Union([Schema.String, Schema.Struct({ name: Schema.String, slug: optionalText })]))),
   publishedAt: optionalText, url: Schema.String,
 };
 export const ContentSearch = Schema.Struct({ items: Schema.Array(Schema.Struct(ContentFields)) });

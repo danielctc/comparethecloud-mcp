@@ -38,6 +38,9 @@ const oneLine = (value: string | null | undefined, max = 200) => (value ?? '').r
 const listingUrl = (slug: string) => `${SITE_URL}/directory/listing/${encodeURIComponent(slug)}`;
 // Meilisearch filter string literal: escape rather than strip, so O"Brien still matches O"Brien.
 const filterEq = (field: string, value: string) => `${field} = "${value.replace(/[\\"]/g, m => `\\${m}`).replace(/[\r\n]+/g, ' ')}"`;
+/** The author line for a content item: www sends a name-and-slug object, a plain name, or nothing. */
+const authorName = (author: string | { name: string } | null | undefined) =>
+  typeof author === 'string' ? author : author?.name ?? null;
 const fields = (record: Record<string, unknown>) => Object.entries(record)
   .filter(([, value]) => value !== null && value !== undefined)
   .map(([key, value]) => `- ${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join('\n');
@@ -64,7 +67,7 @@ const knowledgeFetch = Effect.fn('knowledgeFetch')(function* (id: string, contex
   const { item } = yield* upstreamJson(context, `/api/content/${type}/${encodeURIComponent(slug)}`, S.Content);
   const { text, truncated } = truncate(item.text, 60_000);
   return knowledgeResult({ id, title: item.title, text, url: item.url,
-    metadata: { source: 'Compare the Cloud', type, author: item.author ?? null, publishedAt: item.publishedAt ?? null, truncated, note: SOURCE } });
+    metadata: { source: 'Compare the Cloud', type, author: authorName(item.author), publishedAt: item.publishedAt ?? null, truncated, note: SOURCE } });
 });
 const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolInput, context: UpstreamContext) {
   switch (name) {
@@ -105,7 +108,7 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
       const query = new URLSearchParams({ q: input.q ?? '', limit: String(clamp(input.limit, 10, 20)) });
       if (input.type) query.set('type', input.type);
       const data = yield* upstreamJson(context, `/api/content/search?${query}`, S.ContentSearch);
-      return result(data.items.map(item => `- [${oneLine(item.title)}](${item.url}) (${item.type})\n  ${oneLine(item.summary)}\n  Compare the Cloud, ${item.author ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`).join('\n\n'), data);
+      return result(data.items.map(item => `- [${oneLine(item.title)}](${item.url}) (${item.type})\n  ${oneLine(item.summary)}\n  Compare the Cloud, ${authorName(item.author) ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`).join('\n\n'), data);
     }
     case 'get_content': {
       const data = yield* upstreamJson(context, `/api/content/${input.type}/${encodeURIComponent(input.slug!)}`, S.Content);
@@ -113,7 +116,7 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
       // The body appears in both blocks on purpose: the MCP spec treats structuredContent as the
       // machine-readable result and the text block as its readable mirror, so neither may drop it.
       const item = { ...data.item, text };
-      return result(`# ${item.title}\n\n${text}${truncated ? '\n\n[truncated at 60,000 characters]' : ''}\n\nCompare the Cloud, ${item.author ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`, { item, truncated });
+      return result(`# ${item.title}\n\n${text}${truncated ? '\n\n[truncated at 60,000 characters]' : ''}\n\nCompare the Cloud, ${authorName(item.author) ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`, { item, truncated });
     }
     case 'search': return yield* knowledgeSearch(input.query!, context);
     case 'fetch': return yield* knowledgeFetch(input.id!, context);
