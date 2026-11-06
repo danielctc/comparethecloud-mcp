@@ -31,7 +31,7 @@ it.each(Object.keys(fixtures) as ToolName[])('%s returns structured content and 
   expect(init.headers).toMatchObject({ 'X-CTC-Upstream-Secret': 'test-upstream-token', 'X-CTC-RL-Key': 'ip:192.0.2.1', 'User-Agent': 'ctc-mcp/1.0.0 (+https://mcp.comparethecloud.net)' });
   expect(init.signal).toBeInstanceOf(AbortSignal); expect(init.redirect).toBe('manual');
 });
-it('serves GETs from the edge cache and stores only successes there', async () => {
+it('serves GETs from the edge cache and stores only decoded successes there', async () => {
   const stored = new Map<string, Response>();
   const match = vi.fn(async (url: URL) => stored.get(url.href)?.clone());
   const put = vi.fn(async (url: URL, response: Response) => { stored.set(url.href, response); });
@@ -41,13 +41,16 @@ it('serves GETs from the edge cache and stores only successes there', async () =
   const cached = { ...context(), waitUntil: (p: Promise<unknown>) => { pending.push(p); } };
   const miss = await Effect.runPromise(runTool('directory_stats', {}, cached));
   expect(miss.isError).toBe(true); expect(put).not.toHaveBeenCalled();
+  fetch.mockResolvedValue(Response.json({ wrong: 'shape' }));
+  const badShape = await Effect.runPromise(runTool('directory_stats', {}, cached)); await Promise.all(pending);
+  expect(badShape.isError).toBe(true); expect(put).not.toHaveBeenCalled();
   fetch.mockResolvedValue(Response.json({ total: 1, categories: [] }));
   await Effect.runPromise(runTool('directory_stats', {}, cached)); await Promise.all(pending);
   expect(put).toHaveBeenCalledTimes(1);
   fetch.mockClear();
   const hit = await Effect.runPromise(runTool('directory_stats', {}, cached));
   expect(hit.isError).toBeUndefined(); expect(fetch).not.toHaveBeenCalled();
-  expect(match).toHaveBeenCalledTimes(3);
+  expect(match).toHaveBeenCalledTimes(4);
   expect(String(put.mock.calls[0]![0])).toBe('https://mcp.comparethecloud.net/__upstream/api/directory/stats');
 });
 it('explains that absence from the directory proves nothing about company existence', async () => {
