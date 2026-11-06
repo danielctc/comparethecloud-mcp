@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ctc-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "routes": [{ "pattern": "mcp.comparethecloud.net", "custom_domain": true }],
+  "kv_namespaces": [{ "binding": "MCP_KEYS", "id": "7ed3b23ca97f4873a756981b0b246b7c" }],
+  // Same-zone subrequests from a Worker bypass the www Worker, so call it through a service binding.
+  "services": [{ "binding": "SITE", "service": "compare-the-cloud" }],
+  "unsafe": {
+    "bindings": [
+      { "name": "RL_ANON", "type": "ratelimit", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+      { "name": "RL_KEY", "type": "ratelimit", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } }
+    ]
+  },
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "vars": {
+    "SITE_ORIGIN": "https://www.comparethecloud.net",
+    "RESEND_FROM": "Compare the Cloud <mcp@comparethecloud.net>",
+    "PUBLIC_ORIGIN": "https://mcp.comparethecloud.net"
+  },
+  "observability": { "enabled": false }
+}
