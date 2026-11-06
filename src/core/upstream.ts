@@ -27,7 +27,7 @@ export const requestUpstream = Effect.fn('requestUpstream')(function* (
   // with the www zone's own CDN cache for the same public URL.
   const cacheKey = new URL(`/__upstream${url.pathname}${url.search}`, context.env.PUBLIC_ORIGIN);
   const cached = cache ? yield* Effect.promise(() => cache.match(cacheKey).catch(() => undefined)) : undefined;
-  if (cached) return cached;
+  if (cached) return { response: cached, remember: () => undefined, forget: () => undefined };
   // Through the service binding: a plain fetch to the same zone would skip the www Worker.
   const response = yield* Effect.tryPromise({
     try: () => context.env.SITE.fetch(url, {
@@ -47,24 +47,26 @@ export const requestUpstream = Effect.fn('requestUpstream')(function* (
   if (!response.ok) {
     return yield* new UpstreamError({ status: response.status, message: `Upstream returned HTTP ${response.status}.` });
   }
-  // Only successes are stored; a transient 404 or 5xx must never be served for the TTL.
-  if (cache) {
-    const stored = cache.put(cacheKey, response.clone()).catch(() => undefined);
-    context.waitUntil?.(stored);
-  }
-  return response;
+  // A success is stored only once the caller has accepted its body: a 200 with the wrong shape (a site
+  // mid-deploy, for example) must never be served for the whole TTL. `remember` stores, `forget` discards.
+  const copy = cache ? response.clone() : null;
+  const remember = () => { if (cache && copy) context.waitUntil?.(cache.put(cacheKey, copy).catch(() => undefined)); };
+  const forget = () => { void copy?.body?.cancel().catch(() => undefined); };
+  return { response, remember, forget };
 });
 
 export const upstreamJson = Effect.fn('upstreamJson')(function* <S extends Schema.Constraint>(
   context: UpstreamContext, path: string, schema: S, body?: unknown,
 ) {
-  const response = yield* requestUpstream(context, path, body);
+  const { response, remember, forget } = yield* requestUpstream(context, path, body);
   const value = yield* Effect.tryPromise({
     try: () => response.json(),
     catch: () => new UpstreamError({ status: 0, message: 'Upstream returned invalid JSON.' }),
-  });
+  }).pipe(Effect.tapError(() => Effect.sync(forget)));
   return yield* Schema.decodeUnknownEffect(schema)(value).pipe(
     Effect.mapError(() => new UpstreamError({ status: 0, message: 'Upstream returned an unexpected response shape.' })),
+    Effect.tapError(() => Effect.sync(forget)),
+    Effect.tap(() => Effect.sync(remember)),
   );
 });
 
@@ -73,10 +75,10 @@ export const truncate = (text: string, max: number) => ({ text: text.slice(0, ma
 
 // The site guide is cached like every other GET, for as long as www says (an hour at the time of writing).
 export const siteGuide = Effect.fn('siteGuide')(function* (context: UpstreamContext) {
-  const response = yield* requestUpstream(context, '/llms.txt');
+  const { response, remember, forget } = yield* requestUpstream(context, '/llms.txt');
   const text = yield* Effect.tryPromise({
     try: () => response.text(),
     catch: () => new UpstreamError({ status: 0, message: 'Could not read the site guide.' }),
-  });
+  }).pipe(Effect.tapError(() => Effect.sync(forget)), Effect.tap(() => Effect.sync(remember)));
   return truncate(text, 40_000);
 });
