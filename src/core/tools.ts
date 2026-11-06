@@ -1,6 +1,6 @@
 import { Effect, Schema } from 'effect';
 import { z } from 'zod';
-import { definitions } from './tool-input';
+import { definitions, KNOWLEDGE_ID } from './tool-input';
 import * as S from './schemas';
 import { SITE_URL } from '../env';
 import { siteGuide, truncate, upstreamJson, type UpstreamContext } from './upstream';
@@ -28,12 +28,10 @@ export const result = (text: string, data: Record<string, unknown>, isError = fa
   content: [{ type: 'text', text: `${SOURCE}\n\n${text}` }], structuredContent: data,
   ...(isError ? { isError: true } : {}),
 });
-// OpenAI reads the JSON back from the content array, so it is the only text block; the source note
-// travels inside the object instead of in front of it.
-const knowledgeResult = (data: Record<string, unknown>): ToolResult => {
-  const payload = { ...data, source: SOURCE };
-  return { content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: payload };
-};
+// OpenAI reads the JSON back from the content array, so it is the only text block. The object carries
+// exactly the declared output schema; the untrusted-content note rides in fetch metadata, not at the top.
+const knowledgeResult = (data: Record<string, unknown>): ToolResult =>
+  ({ content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data });
 const clamp = (value: number | undefined, fallback: number, max: number) =>
   Math.max(1, Math.min(max, Math.trunc(value ?? fallback)));
 const oneLine = (value: string | null | undefined, max = 200) => (value ?? '').replace(/\s+/g, ' ').slice(0, max);
@@ -50,26 +48,24 @@ const knowledgeSearch = Effect.fn('knowledgeSearch')(function* (query: string, c
     upstreamJson(context, '/api/directory/search', S.ProviderSearch, { q: query, limit: 10, offset: 0, filter: [] }),
     upstreamJson(context, `/api/content/search?${new URLSearchParams({ q: query, limit: '10' })}`, S.ContentSearch),
   ], { concurrency: 2 });
-  return knowledgeResult({ results: [
+  const results = [
     ...providers.hits.map(hit => ({ id: `provider:${hit.slug}`, title: hit.name, url: listingUrl(hit.slug) })),
     ...content.items.map(item => ({ id: `${item.type}:${item.slug}`, title: item.title, url: item.url })),
-  ] });
+  ];
+  // A slug fetch cannot address (a slash, a colon, a dot segment) must not be offered as an id.
+  return knowledgeResult({ results: results.filter(entry => KNOWLEDGE_ID.test(entry.id) && !['.', '..'].includes(entry.id.split(':')[1]!)) });
 });
 const knowledgeFetch = Effect.fn('knowledgeFetch')(function* (id: string, context: UpstreamContext) {
   const [type, slug] = id.split(':') as [string, string];
   if (type === 'provider') {
     const { listing } = yield* upstreamJson(context, `/api/directory/listing/${encodeURIComponent(slug)}`, S.Provider);
-    return knowledgeResult({ id, title: listing.name, text: fields(listing), url: listingUrl(slug), metadata: { source: 'Compare the Cloud', type } });
+    return knowledgeResult({ id, title: listing.name, text: fields(listing), url: listingUrl(slug), metadata: { source: 'Compare the Cloud', type, note: SOURCE } });
   }
   const { item } = yield* upstreamJson(context, `/api/content/${type}/${encodeURIComponent(slug)}`, S.Content);
   const { text, truncated } = truncate(item.text, 60_000);
   return knowledgeResult({ id, title: item.title, text, url: item.url,
-    metadata: { source: 'Compare the Cloud', type, author: item.author ?? null, publishedAt: item.publishedAt ?? null, truncated } });
+    metadata: { source: 'Compare the Cloud', type, author: item.author ?? null, publishedAt: item.publishedAt ?? null, truncated, note: SOURCE } });
 });
-/** The two tools in OpenAI's company-knowledge shape; everything else keeps the readable directory format. */
-const knowledgeTool = (name: 'search' | 'fetch', input: ToolInput, context: UpstreamContext) =>
-  name === 'search' ? knowledgeSearch(input.query!, context) : knowledgeFetch(input.id!, context);
-
 const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolInput, context: UpstreamContext) {
   switch (name) {
     case 'search_providers': {
@@ -119,8 +115,8 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
       const item = { ...data.item, text };
       return result(`# ${item.title}\n\n${text}${truncated ? '\n\n[truncated at 60,000 characters]' : ''}\n\nCompare the Cloud, ${item.author ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`, { item, truncated });
     }
-    case 'search': case 'fetch':
-      return yield* knowledgeTool(name, input, context);
+    case 'search': return yield* knowledgeSearch(input.query!, context);
+    case 'fetch': return yield* knowledgeFetch(input.id!, context);
     case 'site_guide': {
       const data = yield* siteGuide(context);
       return result(data.text, data);
@@ -152,7 +148,16 @@ export const callTool = Effect.fn('callTool')(function* (name: string, args: unk
     const tool = yield* Schema.decodeUnknownEffect(ToolNameSchema)(name);
     const parsed = z.object(definitions[tool].inputSchema).safeParse(args);
     if (!parsed.success) return result('Invalid tool arguments. Check the tool input schema.', { error: 'invalid_arguments' }, true);
-    return yield* runTool(tool, parsed.data, context);
+    const response = yield* runTool(tool, parsed.data, context);
+    // The tools/call handler bypasses the SDK's output validation, so a declared output schema is enforced here:
+    // a result that drifts from what tools/list advertises is an internal error, never a silent mismatch.
+    const definition: { description: string; inputSchema: Record<string, z.ZodType>; outputSchema?: Record<string, z.ZodType> } = definitions[tool];
+    const output = definition.outputSchema;
+    if (output && !response.isError && !z.object(output).strict().safeParse(response.structuredContent).success) {
+      console.error('output_schema_mismatch', tool);
+      return result(INTERNAL_ERROR, { error: 'internal_error' }, true);
+    }
+    return response;
   }).pipe(
     Effect.catch(() => Effect.succeed(result('Unknown tool. Use tools/list to see available tools.', { error: 'unknown_tool' }, true))),
     Effect.catchCause(() => Effect.succeed(result(INTERNAL_ERROR, { error: 'internal_error' }, true))),

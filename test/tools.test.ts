@@ -122,9 +122,16 @@ it('search combines bounded provider and editorial results as one JSON block', a
   expect(response.structuredContent).toEqual({ results: [
     { id: 'provider:example', title: 'Example', url: 'https://www.comparethecloud.net/directory/listing/example' },
     { id: 'article:example', title: 'Example', url: 'https://www.comparethecloud.net/article/example' },
-  ], source: SOURCE });
+  ] });
   expect(response.content).toHaveLength(1); expect(JSON.parse(response.content[0].text)).toEqual(response.structuredContent);
   expect(fetch).toHaveBeenCalledTimes(2);
+});
+it('search offers only ids that fetch will accept', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: URL) => Response.json(url.pathname === '/api/content/search'
+    ? { items: [{ ...fixtures.search_content.items[0], slug: 'guides/cloud' }, { ...fixtures.search_content.items[0], slug: '..' }, fixtures.search_content.items[0]] }
+    : fixtures.search_providers)));
+  const response = await Effect.runPromise(callTool('search', { query: 'cloud' }, context()));
+  expect((response.structuredContent.results as { id: string }[]).map(entry => entry.id)).toEqual(['provider:example', 'article:example']);
 });
 it('search reports an upstream failure from either source rather than returning partial results', async () => {
   vi.stubGlobal('fetch', vi.fn(async (url: URL) => url.pathname === '/api/content/search' ? new Response(null, { status: 404 }) : Response.json(fixtures.search_providers)));
@@ -136,8 +143,9 @@ it.each(['provider', 'article'])('fetch reads the complete %s record as one JSON
   const response = await Effect.runPromise(callTool('fetch', { id: `${type}:example` }, context()));
   expect(response.structuredContent).toMatchObject({ id: `${type}:example`, title: 'Example', text: expect.any(String), url: expect.stringMatching(/^https:/), metadata: { type } });
   expect(response.structuredContent.text).toContain(type === 'provider' ? 'services' : 'Article text');
-  expect(response.structuredContent.source).toBe(SOURCE);
+  expect((response.structuredContent.metadata as { note: string }).note).toBe(SOURCE);
   expect(response.content).toHaveLength(1); expect(JSON.parse(response.content[0].text)).toEqual(response.structuredContent);
+  expect(Object.keys(response.structuredContent).sort()).toEqual(['id', 'metadata', 'text', 'title', 'url']);
 });
 it('fetch reports upstream 404 for an unknown identifier', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 404 })));

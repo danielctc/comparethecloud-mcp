@@ -39,6 +39,3 @@ export const Content = Schema.Struct({ item: Schema.Struct({
   ...ContentFields, updatedAt: optionalText, text: Schema.String,
 }) });
 
-// Company knowledge result shapes.
-export const KnowledgeSearch = Schema.Struct({ results: Schema.Array(Schema.Struct({ id: Schema.String, title: Schema.String, url: Schema.String })) });
-export const KnowledgeFetch = Schema.Struct({ id: Schema.String, title: Schema.String, text: Schema.String, url: Schema.String, metadata: Schema.Record(Schema.String, Schema.Unknown) });

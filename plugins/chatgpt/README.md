@@ -36,10 +36,10 @@ The requested source cases file was unavailable in this checkout; the cases belo
       "expected_output_url": ""
     },
     {
-      "description": "Find similar providers",
-      "prompt": "Find providers similar to Hewlett Packard Enterprise.",
-      "tools_triggered": "similar_providers",
-      "expected_behavior": "Return similar directory listings for hewlett-packard-enterprise with links.",
+      "description": "Company knowledge search and fetch",
+      "prompt": "Using Compare the Cloud, what does it say about Hewlett Packard Enterprise? Search first, then open the best result.",
+      "tools_triggered": "search, fetch",
+      "expected_behavior": "search returns ids with titles and URLs across providers and editorial; fetch opens one id (for example provider:hewlett-packard-enterprise) and the answer cites its URL.",
       "file_attachment_urls": [],
       "expected_output_url": ""
     },
