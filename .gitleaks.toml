@@ -1,0 +1,9 @@
+title = "Compare the Cloud secret checks"
+[extend]
+useDefault = true
+
+[[rules]]
+id = "ctc-mcp-key"
+description = "Compare the Cloud registration key"
+regex = '''ctc_[A-Za-z0-9]{40}'''
+keywords = ["ctc_"]
