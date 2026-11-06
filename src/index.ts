@@ -41,6 +41,9 @@ const decorate = (response: Response, headers: Record<string, string>) => {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (path === '/.well-known/openai-apps-challenge' && request.method === 'GET') {
+      return env.OPENAI_APPS_CHALLENGE ? new Response(env.OPENAI_APPS_CHALLENGE, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }) : new Response(null, { status: 404 });
+    }
     if ((path === '/mcp' || path === '/health') && request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: path === '/mcp' ? anonymousHeaders : cors });
     }

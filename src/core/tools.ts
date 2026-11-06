@@ -10,12 +10,12 @@ export const toolTitles = {
   search_providers: 'Search providers', get_provider: 'Get provider',
   similar_providers: 'Similar providers', list_categories: 'List categories',
   directory_stats: 'Directory statistics', search_content: 'Search content',
-  get_content: 'Get content', site_guide: 'Site guide',
+  get_content: 'Get content', site_guide: 'Site guide', search: 'Search knowledge', fetch: 'Fetch knowledge',
 } as const;
 export type ToolName = keyof typeof toolTitles;
 export interface ToolInput {
   q?: string; category?: string; location?: string; limit?: number;
-  slug?: string; query?: string; facet?: 'primary_category' | 'location_city' | 'services';
+  slug?: string; query?: string; id?: string; facet?: 'primary_category' | 'location_city' | 'services';
   type?: 'article' | 'news' | 'opinion';
 }
 export interface ToolResult {
@@ -28,6 +28,12 @@ export const result = (text: string, data: Record<string, unknown>, isError = fa
   content: [{ type: 'text', text: `${SOURCE}\n\n${text}` }], structuredContent: data,
   ...(isError ? { isError: true } : {}),
 });
+// OpenAI reads the JSON back from the content array, so it is the only text block; the source note
+// travels inside the object instead of in front of it.
+const knowledgeResult = (data: Record<string, unknown>): ToolResult => {
+  const payload = { ...data, source: SOURCE };
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: payload };
+};
 const clamp = (value: number | undefined, fallback: number, max: number) =>
   Math.max(1, Math.min(max, Math.trunc(value ?? fallback)));
 const oneLine = (value: string | null | undefined, max = 200) => (value ?? '').replace(/\s+/g, ' ').slice(0, max);
@@ -87,6 +93,29 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
       const item = { ...data.item, text };
       return result(`# ${item.title}\n\n${text}${truncated ? '\n\n[truncated at 60,000 characters]' : ''}\n\nCompare the Cloud, ${item.author ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`, { item, truncated });
     }
+    case 'search': {
+      const [providers, content] = yield* Effect.all([
+        upstreamJson(context, '/api/directory/search', S.ProviderSearch, { q: input.query, limit: 10, offset: 0, filter: [] }),
+        upstreamJson(context, `/api/content/search?${new URLSearchParams({ q: input.query!, limit: '10' })}`, S.ContentSearch),
+      ], { concurrency: 2 });
+      const data = { results: [
+        ...providers.hits.map(hit => ({ id: `provider:${hit.slug}`, title: hit.name, url: listingUrl(hit.slug) })),
+        ...content.items.map(item => ({ id: `${item.type}:${item.slug}`, title: item.title, url: item.url })),
+      ] };
+      return knowledgeResult(data);
+    }
+    case 'fetch': {
+      const [type, slug] = input.id!.split(':') as [string, string];
+      if (type === 'provider') {
+        const { listing } = yield* upstreamJson(context, `/api/directory/listing/${encodeURIComponent(slug)}`, S.Provider);
+        const data = { id: input.id!, title: listing.name, text: fields(listing), url: listingUrl(slug), metadata: { source: 'Compare the Cloud', type } };
+        return knowledgeResult(data);
+      }
+      const { item } = yield* upstreamJson(context, `/api/content/${type}/${encodeURIComponent(slug)}`, S.Content);
+      const { text, truncated } = truncate(item.text, 60_000);
+      const data = { id: input.id!, title: item.title, text, url: item.url, metadata: { source: 'Compare the Cloud', type, author: item.author ?? null, publishedAt: item.publishedAt ?? null, truncated } };
+      return knowledgeResult(data);
+    }
     case 'site_guide': {
       const data = yield* siteGuide(context);
       return result(data.text, data);
@@ -97,6 +126,7 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
 const INTERNAL_ERROR = 'Could not complete the request.';
 // "Not found" never means "does not exist": each lookup tool says what absence does and does not prove.
 const notFound: Partial<Record<ToolName, (input: ToolInput) => string>> = {
+  fetch: input => `No published record found for identifier "${oneLine(input.id)}".`,
   get_provider: input => `No listing with slug "${oneLine(input.slug)}" in the Compare the Cloud directory. Absence from the directory says nothing about whether the company exists.`,
   similar_providers: input => `No listing with slug "${oneLine(input.slug)}" to compare against. Absence from the directory says nothing about whether the company exists.`,
   get_content: input => `No published ${oneLine(input.type)} with slug "${oneLine(input.slug)}" on Compare the Cloud. It may be unpublished, renamed or never written.`,
