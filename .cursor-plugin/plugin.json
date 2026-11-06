@@ -1,0 +1,12 @@
+{
+  "name": "comparethecloud",
+  "displayName": "Compare the Cloud",
+  "version": "1.0.0",
+  "description": "UK B2B technology provider directory (20,000+ listings) plus articles, news and expert opinion. Read-only MCP server.",
+  "author": { "name": "Compare the Cloud", "url": "https://www.comparethecloud.net" },
+  "homepage": "https://mcp.comparethecloud.net",
+  "repository": "https://github.com/danielctc/comparethecloud-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["directory", "uk", "cloud", "msp", "cybersecurity", "b2b", "research"],
+  "mcpServers": "./mcp.json"
+}

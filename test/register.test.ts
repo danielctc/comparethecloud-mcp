@@ -35,14 +35,24 @@ describe('registration', () => {
     expect(await response.text()).not.toContain(key);
     expect(put.mock.calls.find(([name]) => name.startsWith('reg:'))?.[2]).toMatchObject({ expirationTtl: 3600 });
   });
-  it('retains and revokes the old key on re-registration', async () => {
+  it('refuses an oversized chunked form before reading it all', async () => {
+    const { env, put } = mockEnv();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { for (let i = 0; i < 20; i += 1) controller.enqueue(new TextEncoder().encode('a'.repeat(1024))); controller.close(); },
+    });
+    const request = new Request('https://mcp.comparethecloud.net/register', { method: 'POST', body, duplex: 'half',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '192.0.2.1' } } as RequestInit);
+    const response = await worker.fetch(request, env, createExecutionContext());
+    expect(response.status).toBe(413); expect(put).not.toHaveBeenCalled();
+  });
+  it('keeps the old key active on re-registration (the form proves nothing about who owns the address)', async () => {
     const { env, values } = mockEnv();
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ id: 'email-id' })));
     await worker.fetch(registrationRequest(), env, createExecutionContext());
     const oldHash = values.get('email:person@example.test')!;
     await worker.fetch(registrationRequest(), env, createExecutionContext());
     expect(values.get('email:person@example.test')).not.toBe(oldHash);
-    expect(JSON.parse(values.get(`key:${oldHash}`)!)).toMatchObject({ status: 'revoked' });
+    expect(JSON.parse(values.get(`key:${oldHash}`)!)).toMatchObject({ status: 'active' });
     expect([...values.keys()].filter(key => key.startsWith('key:'))).toHaveLength(2);
   });
   it.each(['http', 'network'])('revokes a new key after an email %s failure', async failure => {

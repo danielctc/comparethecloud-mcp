@@ -35,13 +35,14 @@ it('returns anonymous rate limiting details with CORS and a retry header', async
   expect(await response.json()).toEqual({ error: 'rate_limited', retry_after: 60, register: `${origin}/register` });
   expect(env.RL_ANON.limit).toHaveBeenCalledWith({ key: 'ip:192.0.2.15' });
 });
-it('uses the key hash for the registered bucket and returns its higher policy', async () => {
+it('limits registered callers per email, not per key, and returns the higher policy', async () => {
   const { env, values } = mockEnv(); const key = `ctc_${'a'.repeat(40)}`; const hash = await Effect.runPromise(hashKey(key));
+  const identity = await Effect.runPromise(hashKey(record.email));
   values.set(`key:${hash}`, JSON.stringify(record)); vi.mocked(env.RL_KEY.limit).mockResolvedValue({ success: false });
   const response = await worker.fetch(request('/mcp', { headers: { Authorization: `Bearer ${key}` } }), env, createExecutionContext());
   expect(response.status).toBe(429); expect(response.headers.get('X-CTC-Tier')).toBe('registered');
   expect(response.headers.get('X-RateLimit-Policy')).toBe('600;w=60');
-  expect(env.RL_KEY.limit).toHaveBeenCalledWith({ key: `k:${hash}` }); expect(env.RL_ANON.limit).not.toHaveBeenCalled();
+  expect(env.RL_KEY.limit).toHaveBeenCalledWith({ key: `k:${identity}` }); expect(env.RL_ANON.limit).not.toHaveBeenCalled();
 });
 it.each(['Basic abc', 'Bearer bad', '', `Bearer ctc_${'a'.repeat(40)}`])('rejects malformed or unknown authorisation', async authorization => {
   const { env } = mockEnv();
@@ -57,7 +58,7 @@ it.each(['revoked', 'corrupt'])('rejects a %s key record', async state => {
 it('fails closed if KV is unavailable without exposing internal errors', async () => {
   const { env, get } = mockEnv(); get.mockRejectedValue(new Error('private storage diagnostic'));
   const response = await worker.fetch(request('/mcp', { headers: { Authorization: `Bearer ctc_${'a'.repeat(40)}` } }), env, createExecutionContext());
-  expect(response.status).toBe(503); expect(response.headers.get('X-CTC-Tier')).toBe('registered');
+  expect(response.status).toBe(503); expect(response.headers.get('X-CTC-Tier')).toBe('anonymous');
   expect(await response.json()).toEqual({ error: 'service_unavailable' });
 });
 it('serves mobile-safe landing and registration HTML with security headers', async () => {

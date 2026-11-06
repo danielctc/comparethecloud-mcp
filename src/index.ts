@@ -1,7 +1,7 @@
 import { createMcpHandler } from 'agents/mcp/server';
 import { Effect } from 'effect';
 import { version } from '../package.json';
-import type { Env } from './env';
+import { SITE_URL, TIERS, type Env, type Tier } from './env';
 import { authorise } from './core/keys';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
@@ -18,6 +18,21 @@ const html = (body: string, status = 200) => new Response(body, {
     'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin' },
 });
+const tierHeaders = (tier: Tier) => ({ ...cors, 'X-CTC-Tier': tier, 'X-RateLimit-Policy': TIERS[tier].policy });
+const anonymousHeaders = tierHeaders('anonymous');
+const apiError = (status: number, error: string, headers: Record<string, string>, extra: Record<string, unknown> = {}) =>
+  Response.json({ error, ...extra }, { status, headers });
+/** Parse the browser Origin, if any; null means absent, false means malformed. */
+const browserOrigin = (request: Request): URL | null | false => {
+  const header = request.headers.get('Origin');
+  if (header === null) return null;
+  try {
+    const origin = new URL(header);
+    return ['https:', 'http:'].includes(origin.protocol) && origin.origin === header ? origin : false;
+  } catch {
+    return false;
+  }
+};
 const decorate = (response: Response, headers: Record<string, string>) => {
   const wrapped = new Response(response.body, response);
   for (const [key, value] of Object.entries(headers)) wrapped.headers.set(key, value);
@@ -27,43 +42,33 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
     if ((path === '/mcp' || path === '/health') && request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: { ...cors, ...(path === '/mcp' ? { 'X-CTC-Tier': 'anonymous', 'X-RateLimit-Policy': '60;w=60' } : {}) } });
+      return new Response(null, { status: 204, headers: path === '/mcp' ? anonymousHeaders : cors });
     }
     if (path === '/mcp') {
+      // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
+      const origin = browserOrigin(request);
+      if (origin === false) return apiError(403, 'invalid_origin', anonymousHeaders);
       const decision = await Effect.runPromise(authorise(request, env).pipe(
         Effect.catchCause(() => Effect.succeed(null)),
       ));
-      if (!decision) return Response.json({ error: 'service_unavailable' }, { status: 503, headers: {
-        ...cors, 'X-CTC-Tier': request.headers.has('Authorization') ? 'registered' : 'anonymous',
-        'X-RateLimit-Policy': request.headers.has('Authorization') ? '600;w=60' : '60;w=60',
-      } });
-      const headers = { ...cors, 'X-CTC-Tier': decision.caller.tier, 'X-RateLimit-Policy': decision.caller.policy };
-      if (decision.status !== 200) return Response.json({
-        error: decision.error, ...(decision.status === 429 ? { retry_after: 60 } : {}), register: `${env.PUBLIC_ORIGIN}/register`,
-      }, { status: decision.status, headers: { ...headers, ...(decision.status === 429 ? { 'Retry-After': '60' } : {}) } });
-      const originHeader = request.headers.get('Origin');
-      const allowedOrigins: string[] = [];
-      if (originHeader !== null) {
-        try {
-          const browserOrigin = new URL(originHeader);
-          if (!['https:', 'http:'].includes(browserOrigin.protocol) || browserOrigin.origin !== originHeader) {
-            return Response.json({ error: 'invalid_origin' }, { status: 403, headers });
-          }
-          allowedOrigins.push(browserOrigin.hostname);
-        } catch {
-          return Response.json({ error: 'invalid_origin' }, { status: 403, headers });
-        }
+      // Nothing was verified when authorisation itself failed, so report the anonymous tier.
+      if (!decision) return apiError(503, 'service_unavailable', anonymousHeaders);
+      const headers = tierHeaders(decision.caller.tier);
+      if (decision.status !== 200) {
+        const retryAfter = decision.status === 429 ? TIERS[decision.caller.tier].window : undefined;
+        return apiError(decision.status, decision.error ?? 'error', { ...headers, ...(retryAfter ? { 'Retry-After': String(retryAfter) } : {}) },
+          { ...(retryAfter ? { retry_after: retryAfter } : {}), register: `${env.PUBLIC_ORIGIN}/register` });
       }
-      const handler = createMcpHandler(() => createServer({ env, bucket: decision.caller.bucket }), {
+      const handler = createMcpHandler(() => createServer({ env, bucket: decision.caller.bucket, waitUntil: p => ctx.waitUntil(p) }), {
         corsOptions: false,
         // This public, cookie-free API accepts every valid HTTP(S) browser origin.
-        allowedOriginHostnames: allowedOrigins,
+        allowedOriginHostnames: origin ? [origin.hostname] : [],
         allowedHostnames: [new URL(env.PUBLIC_ORIGIN).hostname, 'localhost', '127.0.0.1', '[::1]'],
       });
       try {
         return decorate(await handler(request, env, ctx), headers);
       } catch {
-        return Response.json({ error: 'internal_error' }, { status: 500, headers });
+        return apiError(500, 'internal_error', headers);
       }
     }
     if (path === '/health' && request.method === 'GET') {
@@ -80,9 +85,9 @@ export default {
       name: 'Compare the Cloud', description: 'Read-only UK B2B technology directory, articles, news and opinion.',
       endpoint: `${env.PUBLIC_ORIGIN}/mcp`, transport: 'streamable-http', auth: 'optional bearer key',
       register: `${env.PUBLIC_ORIGIN}/register`, docs: 'https://github.com/danielctc/comparethecloud-mcp',
-      privacy: 'https://www.comparethecloud.net/privacy-policy', contact: 'https://www.comparethecloud.net/contact',
+      privacy: `${SITE_URL}/privacy-policy`, contact: `${SITE_URL}/contact`,
     });
     if (['/logo.png', '/logo-512.png', '/logo-400.png'].includes(path) && request.method === 'GET') return env.ASSETS.fetch(request);
-    return Response.json({ error: 'not_found' }, { status: 404 });
+    return apiError(404, 'not_found', {});
   },
 } satisfies ExportedHandler<Env>;

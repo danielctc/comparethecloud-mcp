@@ -22,11 +22,29 @@ it.each(Object.keys(fixtures) as ToolName[])('%s returns structured content and 
   const response = await Effect.runPromise(runTool(name, input, context()));
   expect(response.isError).toBeUndefined(); expect(response.content[0].text.startsWith(SOURCE)).toBe(true);
   expect(response.structuredContent).toBeDefined(); expect(fetch).toHaveBeenCalledOnce();
-  const [url, init] = fetch.mock.calls[0] as unknown as [URL, RequestInit & { cf?: { cacheTtl: number } }];
+  const [url, init] = fetch.mock.calls[0] as unknown as [URL, RequestInit];
   expect(url.origin).toBe('https://www.comparethecloud.net');
   expect(init.headers).toMatchObject({ 'X-CTC-Upstream-Secret': 'test-upstream-token', 'X-CTC-RL-Key': 'ip:192.0.2.1', 'User-Agent': 'ctc-mcp/1.0.0 (+https://mcp.comparethecloud.net)' });
-  expect(init.signal).toBeInstanceOf(AbortSignal); expect(init.redirect).toBe('error');
-  if (init.method === 'GET') expect(init.cf?.cacheTtl).toBe(300);
+  expect(init.signal).toBeInstanceOf(AbortSignal); expect(init.redirect).toBe('manual');
+});
+it('serves GETs from the edge cache and stores only successes there', async () => {
+  const stored = new Map<string, Response>();
+  const match = vi.fn(async (url: URL) => stored.get(url.href)?.clone());
+  const put = vi.fn(async (url: URL, response: Response) => { stored.set(url.href, response); });
+  vi.stubGlobal('caches', { default: { match, put } });
+  const fetch = vi.fn(async () => Response.json({ error: 'not_found' }, { status: 404 })); vi.stubGlobal('fetch', fetch);
+  const pending: Promise<unknown>[] = [];
+  const cached = { ...context(), waitUntil: (p: Promise<unknown>) => { pending.push(p); } };
+  const miss = await Effect.runPromise(runTool('directory_stats', {}, cached));
+  expect(miss.isError).toBe(true); expect(put).not.toHaveBeenCalled();
+  fetch.mockResolvedValue(Response.json({ total: 1, categories: [] }));
+  await Effect.runPromise(runTool('directory_stats', {}, cached)); await Promise.all(pending);
+  expect(put).toHaveBeenCalledTimes(1);
+  fetch.mockClear();
+  const hit = await Effect.runPromise(runTool('directory_stats', {}, cached));
+  expect(hit.isError).toBeUndefined(); expect(fetch).not.toHaveBeenCalled();
+  expect(match).toHaveBeenCalledTimes(3);
+  expect(String(put.mock.calls[0]![0])).toBe('https://mcp.comparethecloud.net/__upstream/api/directory/stats');
 });
 it('explains that absence from the directory proves nothing about company existence', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => Response.json({ error: 'not_found' }, { status: 404 })));
@@ -48,11 +66,11 @@ it.each(['network', 'json', 'shape'])('maps %s failures without exposing diagnos
   expect(response.isError).toBe(true); expect(response.content[0].text.startsWith(SOURCE)).toBe(true);
   expect(response.content[0].text).not.toContain('private diagnostic');
 });
-it('sanitises filter values, limits results and keeps the offset fixed', async () => {
+it('escapes filter values for Meilisearch, limits results and keeps the offset fixed', async () => {
   const fetch = vi.fn(async () => Response.json(fixtures.search_providers)); vi.stubGlobal('fetch', fetch);
   const response = await Effect.runPromise(runTool('search_providers', { q: 'cloud', category: 'Cloud"\\\n OR x', location: 'Lon\rdon', limit: 500 }, context()));
   const [, init] = fetch.mock.calls[0] as unknown as [URL, RequestInit];
-  expect(JSON.parse(init.body as string)).toEqual({ q: 'cloud', limit: 20, offset: 0, filter: ['primary_category = "Cloud OR x"', 'location_city = "London"'] });
+  expect(JSON.parse(init.body as string)).toEqual({ q: 'cloud', limit: 20, offset: 0, filter: ['primary_category = "Cloud\\"\\\\  OR x"', 'location_city = "Lon don"'] });
   expect(response.content[0].text).toContain('d'.repeat(200)); expect(response.content[0].text).not.toContain('d'.repeat(201));
 });
 it('preserves every supplied provider field except nulls', async () => {

@@ -1,7 +1,7 @@
-import { Clock, DateTime, Effect, Schema } from 'effect';
-import type { Env } from '../env';
+import { DateTime, Effect, Schema } from 'effect';
+import { SITE_URL, TIERS, type Env } from '../env';
 import { escapeHtml } from '../html';
-import { generateKey, hashKey, readKey, storage, writeKey, type KeyRecord } from './keys';
+import { generateKey, hashKey, readJson, storage, writeKey, type KeyRecord } from './keys';
 
 const length = (min: number, max: number) => Schema.String.check(Schema.isMinLength(min), Schema.isMaxLength(max));
 const Registration = Schema.Struct({
@@ -13,35 +13,61 @@ const Counter = Schema.Struct({ count: Schema.Number, expiresAt: Schema.Number }
 export class RegistrationError extends Schema.TaggedError<RegistrationError>()('RegistrationError', {
   status: Schema.Number, message: Schema.String,
 }) {}
+const SEND_FAILED = 'Could not send, try again later.';
+const MAX_FORM_BYTES = 16_384;
+const tooLarge = () => new RegistrationError({ status: 413, message: 'The registration form is too large.' });
+/** Read the body up to a byte cap, so a chunked request without Content-Length is bounded as well. */
+const readBounded = (request: Request, max: number) => Effect.tryPromise({
+  try: async () => {
+    const reader = request.body?.getReader();
+    if (!reader) return '';
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > max) { await reader.cancel(); throw tooLarge(); }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return new TextDecoder().decode(bytes);
+  },
+  catch: error => error instanceof RegistrationError ? error : new RegistrationError({ status: 400, message: 'Could not read the registration form.' }),
+});
+const sendFailed = () => new RegistrationError({ status: 500, message: SEND_FAILED });
 
 const sendKey = Effect.fn('sendKey')(function* (env: Env, email: string, key: string) {
   const endpoint = `${env.PUBLIC_ORIGIN}/mcp`;
   const cursor = JSON.stringify({ mcpServers: { comparethecloud: {
     url: endpoint, headers: { Authorization: `Bearer ${key}` },
   } } }, null, 2);
-  const text = `Your Compare the Cloud MCP key: ${key}\n\nEndpoint: ${endpoint}\n\nClaude Code:\nclaude mcp add --transport http comparethecloud ${endpoint} --header "Authorization: Bearer ${key}"\n\nCursor JSON (.cursor/mcp.json), also suitable for clients accepting MCP JSON configuration:\n${cursor}\n\nCodex CLI:\ncodex mcp add comparethecloud --url ${endpoint} --bearer-token-env-var CTC_MCP_KEY\nSet CTC_MCP_KEY to your key in your shell environment.\n\nLimit: 600 requests/min. Keep your key private.\nHelp: https://www.comparethecloud.net/contact`;
+  const text = `Your Compare the Cloud MCP key: ${key}\n\nEndpoint: ${endpoint}\n\nClaude Code:\nclaude mcp add --transport http comparethecloud ${endpoint} --header "Authorization: Bearer ${key}"\n\nCursor JSON (.cursor/mcp.json), also suitable for clients accepting MCP JSON configuration:\n${cursor}\n\nCodex CLI:\ncodex mcp add comparethecloud --url ${endpoint} --bearer-token-env-var CTC_MCP_KEY\nSet CTC_MCP_KEY to your key in your shell environment.\n\nLimit: ${TIERS.registered.limit} requests/min. Keep your key private.\nHelp: ${SITE_URL}/contact`;
   const response = yield* Effect.tryPromise({
     try: () => fetch('https://api.resend.com/emails', {
-      method: 'POST', signal: AbortSignal.timeout(10_000), redirect: 'error',
+      method: 'POST', signal: AbortSignal.timeout(10_000), redirect: 'manual',
       headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: env.RESEND_FROM, to: [email], subject: 'Your Compare the Cloud MCP key',
         text, html: `<html lang="en-GB"><body style="font-family:system-ui;color:#0F172A;background:#FFFFFF"><h1>Your Compare the Cloud MCP key</h1><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escapeHtml(text)}</pre></body></html>`,
       }),
     }),
-    catch: () => new RegistrationError({ status: 500, message: 'Could not send, try again later.' }),
+    catch: () => sendFailed(),
   });
-  if (!response.ok) return yield* new RegistrationError({ status: 500, message: 'Could not send, try again later.' });
+  if (!response.ok) {
+    const detail = yield* Effect.tryPromise({ try: () => response.text(), catch: () => sendFailed() });
+    console.error('resend_failed', response.status, detail.slice(0, 300));
+    return yield* sendFailed();
+  }
 });
 
 export const register = Effect.fn('register')(function* (request: Request, env: Env) {
   if (!request.headers.get('Content-Type')?.toLowerCase().startsWith('application/x-www-form-urlencoded')) {
     return yield* new RegistrationError({ status: 415, message: 'Please submit the registration form.' });
   }
-  const raw = yield* Effect.tryPromise({
-    try: () => request.text(),
-    catch: () => new RegistrationError({ status: 400, message: 'Could not read the registration form.' }),
-  });
-  if (raw.length > 16_384) return yield* new RegistrationError({ status: 413, message: 'The registration form is too large.' });
+  if (Number(request.headers.get('Content-Length') ?? 0) > MAX_FORM_BYTES) return yield* tooLarge();
+  const raw = yield* readBounded(request, MAX_FORM_BYTES);
   const form = new URLSearchParams(raw);
   if (form.get('website')) return { status: 200, sent: true };
   const details = yield* Schema.decodeUnknownEffect(Registration)({
@@ -51,23 +77,20 @@ export const register = Effect.fn('register')(function* (request: Request, env: 
     status: 400, message: 'Enter a name (2–80 characters), a valid work email and your intended use (10–500 characters), and agree to the terms and privacy policy.',
   })));
   const counterKey = `reg:${request.headers.get('CF-Connecting-IP') ?? 'unknown'}`;
-  const now = yield* Clock.currentTimeMillis;
-  const rawCounter = yield* storage(() => env.MCP_KEYS.get(counterKey));
-  const stored = rawCounter === null ? null : yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Counter))(rawCounter);
+  const clock = yield* DateTime.now;
+  const now = DateTime.toEpochMillis(clock);
+  const stored = yield* readJson(env, counterKey, Counter);
   const counter = stored && stored.expiresAt > now ? stored : { count: 0, expiresAt: now + 3_600_000 };
   if (counter.count >= 5) return yield* new RegistrationError({ status: 429, message: 'Too many registrations. Please try again in an hour.' });
   yield* storage(() => env.MCP_KEYS.put(counterKey, JSON.stringify({ ...counter, count: counter.count + 1 }), {
     expirationTtl: Math.max(60, Math.ceil((counter.expiresAt - now) / 1000)),
   }));
+  // Re-registering issues an additional key and leaves earlier keys active: the form proves nothing about
+  // who owns the address, so revoking here would let anyone lock a user out. Revocation is operator-only.
   const emailKey = `email:${details.email}`;
-  const oldHash = yield* storage(() => env.MCP_KEYS.get(emailKey));
-  if (oldHash) {
-    const old = yield* readKey(env, oldHash);
-    if (old) yield* writeKey(env, oldHash, { ...old, status: 'revoked' });
-  }
   const key = yield* generateKey;
   const hash = yield* hashKey(key);
-  const createdAt = DateTime.formatIso(yield* DateTime.now);
+  const createdAt = DateTime.formatIso(clock);
   const record: KeyRecord = { name: details.name, email: details.email, org: details.org, use: details.use,
     createdAt, tier: 'registered', status: 'active' };
   yield* writeKey(env, hash, record);
@@ -82,8 +105,13 @@ export const register = Effect.fn('register')(function* (request: Request, env: 
 
 export const registerSafely = Effect.fn('registerSafely')(function* (request: Request, env: Env) {
   return yield* register(request, env).pipe(
-    Effect.catch(error => Effect.succeed({ status: error._tag === 'RegistrationError' ? error.status : 500,
-      sent: false, message: error._tag === 'RegistrationError' ? error.message : 'Could not send, try again later.' })),
-    Effect.catchCause(() => Effect.succeed({ status: 500, sent: false, message: 'Could not send, try again later.' })),
+    Effect.catch(error => {
+      if (error._tag === 'RegistrationError') return Effect.succeed({ status: error.status, sent: false, message: error.message });
+      console.error('register_failed', error._tag, error._tag === 'CorruptRecord' ? error.key : '');
+      // A corrupt counter row blocks that IP until its TTL passes; say so rather than blaming the email.
+      if (error._tag === 'CorruptRecord') return Effect.succeed({ status: 503, sent: false, message: 'Registration is temporarily unavailable, try again later.' });
+      return Effect.succeed({ status: 500, sent: false, message: SEND_FAILED });
+    }),
+    Effect.catchCause(() => Effect.succeed({ status: 500, sent: false, message: SEND_FAILED })),
   );
 });

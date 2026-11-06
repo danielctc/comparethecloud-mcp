@@ -60,6 +60,16 @@ Codex CLI uses TOML configuration; the Cursor JSON above is for clients that acc
 
 Developer mode → connectors → URL: `https://mcp.comparethecloud.net/mcp`.
 
+### Gemini CLI
+
+```sh
+gemini extensions install https://github.com/danielctc/comparethecloud-mcp
+```
+
+The repo root carries `gemini-extension.json` (Gemini CLI), `.cursor-plugin/plugin.json` with `mcp.json`
+(Cursor), and `.claude-plugin/plugin.json` with `.mcp.json` (Claude Code plugins). All point at the same
+hosted endpoint.
+
 ### Local stdio
 
 ```sh
@@ -134,7 +144,7 @@ The registry test uses the unmodified official [2025-12-11 schema](https://stati
 
 ## Operations
 
-Create a KV namespace and replace `__MCP_KEYS_ID__` in `wrangler.jsonc` with its ID in your deployment checkout. Keep real IDs out of public commits:
+`wrangler.jsonc` carries the production `MCP_KEYS` namespace ID and the `SITE` service binding to the `compare-the-cloud` Worker. A namespace ID is a resource name, not a credential; writes still need account auth. For a fresh deployment create your own namespace and swap the ID:
 
 ```sh
 npx wrangler kv namespace create MCP_KEYS

@@ -1,5 +1,5 @@
 import { Effect, Schema } from 'effect';
-import type { Env, Caller } from '../env';
+import { TIERS, type Env, type Caller } from '../env';
 
 export const KeyRecord = Schema.Struct({
   name: Schema.String, email: Schema.String, org: Schema.String, use: Schema.String,
@@ -8,6 +8,7 @@ export const KeyRecord = Schema.Struct({
 });
 export type KeyRecord = typeof KeyRecord.Type;
 export class StorageError extends Schema.TaggedError<StorageError>()('StorageError', {}) {}
+export class CorruptRecord extends Schema.TaggedError<CorruptRecord>()('CorruptRecord', { key: Schema.String }) {}
 export const storage = <A>(operation: () => Promise<A>) => Effect.tryPromise({
   try: operation, catch: () => new StorageError({}),
 });
@@ -15,13 +16,18 @@ export const hashKey = Effect.fn('hashKey')(function* (key: string) {
   const digest = yield* storage(() => crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)));
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
 });
-export const readKey = Effect.fn('readKey')(function* (env: Env, hash: string) {
-  const raw = yield* storage(() => env.MCP_KEYS.get(`key:${hash}`));
+/** Read a JSON record from KV: null when missing, CorruptRecord when unreadable, so a limiter never fails open. */
+export const readJson = Effect.fn('readJson')(function* <S extends Schema.Top>(env: Env, key: string, schema: S) {
+  const raw = yield* storage(() => env.MCP_KEYS.get(key));
   if (raw === null) return null;
-  return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(KeyRecord))(raw).pipe(
-    Effect.catch(() => Effect.succeed(null)),
+  return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(raw).pipe(
+    Effect.mapError(() => new CorruptRecord({ key })),
   );
 });
+/** A corrupt key record reads as "no such key" (a 401); a storage failure still propagates (a 503). */
+export const readKey = (env: Env, hash: string) => readJson(env, `key:${hash}`, KeyRecord).pipe(
+  Effect.catchTag('CorruptRecord', () => Effect.succeed(null)),
+);
 export const writeKey = (env: Env, hash: string, record: KeyRecord) =>
   storage(() => env.MCP_KEYS.put(`key:${hash}`, JSON.stringify(record)));
 
@@ -41,17 +47,19 @@ export type AuthDecision = { caller: Caller; status: number; error?: string };
 export const authorise = Effect.fn('authorise')(function* (request: Request, env: Env): Effect.fn.Return<AuthDecision, StorageError> {
   const header = request.headers.get('Authorization');
   const caller: Caller = header === null
-    ? { tier: 'anonymous', policy: '60;w=60', bucket: `ip:${request.headers.get('CF-Connecting-IP') ?? 'unknown'}` }
-    : { tier: 'registered', policy: '600;w=60', bucket: '' };
+    ? { tier: 'anonymous', bucket: `ip:${request.headers.get('CF-Connecting-IP') ?? 'unknown'}` }
+    : { tier: 'registered', bucket: '' };
   if (header !== null) {
     const match = /^Bearer (ctc_[A-Za-z0-9]{40})$/i.exec(header);
     if (!match || !match[1].startsWith('ctc_')) return { caller, status: 401, error: 'invalid_key' };
     const hash = yield* hashKey(match[1]);
     const record = yield* readKey(env, hash);
     if (!record || record.status !== 'active') return { caller, status: 401, error: 'invalid_key' };
-    caller.bucket = `k:${hash}`;
+    // The quota belongs to the person, not the key: re-registering mints another key but no extra allowance.
+    // The bucket keeps the `k:` prefix because www only accepts `k:` and `ip:` forwarded caller keys.
+    caller.bucket = `k:${yield* hashKey(record.email.trim().toLowerCase())}`;
   }
-  const limiter = caller.tier === 'anonymous' ? env.RL_ANON : env.RL_KEY;
+  const limiter = env[TIERS[caller.tier].binding];
   const rate = yield* storage(() => limiter.limit({ key: caller.bucket }));
   return rate.success ? { caller, status: 200 } : { caller, status: 429, error: 'rate_limited' };
 });

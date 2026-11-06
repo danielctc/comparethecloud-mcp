@@ -10,6 +10,8 @@ export function mockEnv() {
     RL_ANON: { limit: vi.fn(async () => ({ success: true })) },
     RL_KEY: { limit: vi.fn(async () => ({ success: true })) },
     ASSETS: { fetch: vi.fn(async () => new Response('image')) } as unknown as Fetcher,
+    // The service binding resolves the global fetch at call time, so vi.stubGlobal('fetch') still intercepts it.
+    SITE: { fetch: (input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init) } as unknown as Fetcher,
     SITE_ORIGIN: 'https://www.comparethecloud.net', PUBLIC_ORIGIN: 'https://mcp.comparethecloud.net',
     RESEND_FROM: 'Compare the Cloud <mcp@comparethecloud.net>',
     RESEND_API_KEY: 'test-email-token', UPSTREAM_SECRET: 'test-upstream-token',
