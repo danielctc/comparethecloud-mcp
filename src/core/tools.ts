@@ -44,23 +44,16 @@ const fields = (record: Record<string, unknown>) => Object.entries(record)
   .filter(([, value]) => value !== null && value !== undefined)
   .map(([key, value]) => `- ${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join('\n');
 
-/** Run an upstream call to a settled outcome, so independent sources can succeed or fail on their own. */
-const settle = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(
-  Effect.map(value => ({ ok: true as const, value })),
-  Effect.catch(error => Effect.succeed({ ok: false as const, error })),
-);
 const knowledgeSearch = Effect.fn('knowledgeSearch')(function* (query: string, context: UpstreamContext) {
-  // Each source degrades to nothing on its own; the call fails only when both are down.
+  // Both sources must answer: a failed upstream call is reported, never papered over with partial results.
   const [providers, content] = yield* Effect.all([
-    settle(upstreamJson(context, '/api/directory/search', S.ProviderSearch, { q: query, limit: 10, offset: 0, filter: [] }).pipe(
-      Effect.map(data => data.hits.map(hit => ({ id: `provider:${hit.slug}`, title: hit.name, url: listingUrl(hit.slug) }))),
-    )),
-    settle(upstreamJson(context, `/api/content/search?${new URLSearchParams({ q: query, limit: '10' })}`, S.ContentSearch).pipe(
-      Effect.map(data => data.items.map(item => ({ id: `${item.type}:${item.slug}`, title: item.title, url: item.url }))),
-    )),
+    upstreamJson(context, '/api/directory/search', S.ProviderSearch, { q: query, limit: 10, offset: 0, filter: [] }),
+    upstreamJson(context, `/api/content/search?${new URLSearchParams({ q: query, limit: '10' })}`, S.ContentSearch),
   ], { concurrency: 2 });
-  if (!providers.ok && !content.ok) return yield* providers.error;
-  return knowledgeResult({ results: [...(providers.ok ? providers.value : []), ...(content.ok ? content.value : [])] });
+  return knowledgeResult({ results: [
+    ...providers.hits.map(hit => ({ id: `provider:${hit.slug}`, title: hit.name, url: listingUrl(hit.slug) })),
+    ...content.items.map(item => ({ id: `${item.type}:${item.slug}`, title: item.title, url: item.url })),
+  ] });
 });
 const knowledgeFetch = Effect.fn('knowledgeFetch')(function* (id: string, context: UpstreamContext) {
   const [type, slug] = id.split(':') as [string, string];
