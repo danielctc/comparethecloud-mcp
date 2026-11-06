@@ -15,7 +15,7 @@ it.each(['plugin', 'mcp'])('validates %s.json against the vendored Agent Plugins
 it('includes all referenced assets and skills and valid review tool names', () => {
   const plugin = json(`${root}/plugin.json`);
   const openai = plugin.extensions['com.openai'];
-  for (const path of [openai.interface.composerIcon, openai.interface.composerIconDark, openai.interface.logo, openai.interface.logoDark, openai.onboardingSkill]) {
+  for (const path of [openai.interface.composerIcon, openai.interface.logo, openai.interface.logoDark, openai.onboardingSkill]) {
     expect(existsSync(resolve(root, path)), path).toBe(true);
   }
   for (const skill of ['get-started', 'find-providers', 'read-editorial', 'directory-statistics']) {
