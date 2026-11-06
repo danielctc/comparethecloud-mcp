@@ -126,6 +126,17 @@ it('search combines bounded provider and editorial results as one JSON block', a
   expect(response.content).toHaveLength(1); expect(JSON.parse(response.content[0].text)).toEqual(response.structuredContent);
   expect(fetch).toHaveBeenCalledTimes(2);
 });
+it('search still returns provider results when the editorial endpoint is down', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: URL) => url.pathname === '/api/content/search' ? new Response(null, { status: 404 }) : Response.json(fixtures.search_providers)));
+  const response = await Effect.runPromise(callTool('search', { query: 'cloud' }, context()));
+  expect(response.isError).toBeUndefined();
+  expect(response.structuredContent.results).toEqual([{ id: 'provider:example', title: 'Example', url: 'https://www.comparethecloud.net/directory/listing/example' }]);
+});
+it('search fails only when both sources are down', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 503 })));
+  const response = await Effect.runPromise(callTool('search', { query: 'cloud' }, context()));
+  expect(response.isError).toBe(true); expect(response.structuredContent.status).toBe(503);
+});
 it.each(['provider', 'article'])('fetch reads the complete %s record as one JSON block', async type => {
   vi.stubGlobal('fetch', vi.fn(async () => Response.json(type === 'provider' ? fixtures.get_provider : fixtures.get_content)));
   const response = await Effect.runPromise(callTool('fetch', { id: `${type}:example` }, context()));

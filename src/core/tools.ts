@@ -44,6 +44,39 @@ const fields = (record: Record<string, unknown>) => Object.entries(record)
   .filter(([, value]) => value !== null && value !== undefined)
   .map(([key, value]) => `- ${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join('\n');
 
+/** Run an upstream call to a settled outcome, so independent sources can succeed or fail on their own. */
+const settle = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(
+  Effect.map(value => ({ ok: true as const, value })),
+  Effect.catch(error => Effect.succeed({ ok: false as const, error })),
+);
+const knowledgeSearch = Effect.fn('knowledgeSearch')(function* (query: string, context: UpstreamContext) {
+  // Each source degrades to nothing on its own; the call fails only when both are down.
+  const [providers, content] = yield* Effect.all([
+    settle(upstreamJson(context, '/api/directory/search', S.ProviderSearch, { q: query, limit: 10, offset: 0, filter: [] }).pipe(
+      Effect.map(data => data.hits.map(hit => ({ id: `provider:${hit.slug}`, title: hit.name, url: listingUrl(hit.slug) }))),
+    )),
+    settle(upstreamJson(context, `/api/content/search?${new URLSearchParams({ q: query, limit: '10' })}`, S.ContentSearch).pipe(
+      Effect.map(data => data.items.map(item => ({ id: `${item.type}:${item.slug}`, title: item.title, url: item.url }))),
+    )),
+  ], { concurrency: 2 });
+  if (!providers.ok && !content.ok) return yield* providers.error;
+  return knowledgeResult({ results: [...(providers.ok ? providers.value : []), ...(content.ok ? content.value : [])] });
+});
+const knowledgeFetch = Effect.fn('knowledgeFetch')(function* (id: string, context: UpstreamContext) {
+  const [type, slug] = id.split(':') as [string, string];
+  if (type === 'provider') {
+    const { listing } = yield* upstreamJson(context, `/api/directory/listing/${encodeURIComponent(slug)}`, S.Provider);
+    return knowledgeResult({ id, title: listing.name, text: fields(listing), url: listingUrl(slug), metadata: { source: 'Compare the Cloud', type } });
+  }
+  const { item } = yield* upstreamJson(context, `/api/content/${type}/${encodeURIComponent(slug)}`, S.Content);
+  const { text, truncated } = truncate(item.text, 60_000);
+  return knowledgeResult({ id, title: item.title, text, url: item.url,
+    metadata: { source: 'Compare the Cloud', type, author: item.author ?? null, publishedAt: item.publishedAt ?? null, truncated } });
+});
+/** The two tools in OpenAI's company-knowledge shape; everything else keeps the readable directory format. */
+const knowledgeTool = (name: 'search' | 'fetch', input: ToolInput, context: UpstreamContext) =>
+  name === 'search' ? knowledgeSearch(input.query!, context) : knowledgeFetch(input.id!, context);
+
 const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolInput, context: UpstreamContext) {
   switch (name) {
     case 'search_providers': {
@@ -93,29 +126,8 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
       const item = { ...data.item, text };
       return result(`# ${item.title}\n\n${text}${truncated ? '\n\n[truncated at 60,000 characters]' : ''}\n\nCompare the Cloud, ${item.author ?? 'author not supplied'}, ${item.publishedAt ?? 'date not supplied'}, ${item.url}`, { item, truncated });
     }
-    case 'search': {
-      const [providers, content] = yield* Effect.all([
-        upstreamJson(context, '/api/directory/search', S.ProviderSearch, { q: input.query, limit: 10, offset: 0, filter: [] }),
-        upstreamJson(context, `/api/content/search?${new URLSearchParams({ q: input.query!, limit: '10' })}`, S.ContentSearch),
-      ], { concurrency: 2 });
-      const data = { results: [
-        ...providers.hits.map(hit => ({ id: `provider:${hit.slug}`, title: hit.name, url: listingUrl(hit.slug) })),
-        ...content.items.map(item => ({ id: `${item.type}:${item.slug}`, title: item.title, url: item.url })),
-      ] };
-      return knowledgeResult(data);
-    }
-    case 'fetch': {
-      const [type, slug] = input.id!.split(':') as [string, string];
-      if (type === 'provider') {
-        const { listing } = yield* upstreamJson(context, `/api/directory/listing/${encodeURIComponent(slug)}`, S.Provider);
-        const data = { id: input.id!, title: listing.name, text: fields(listing), url: listingUrl(slug), metadata: { source: 'Compare the Cloud', type } };
-        return knowledgeResult(data);
-      }
-      const { item } = yield* upstreamJson(context, `/api/content/${type}/${encodeURIComponent(slug)}`, S.Content);
-      const { text, truncated } = truncate(item.text, 60_000);
-      const data = { id: input.id!, title: item.title, text, url: item.url, metadata: { source: 'Compare the Cloud', type, author: item.author ?? null, publishedAt: item.publishedAt ?? null, truncated } };
-      return knowledgeResult(data);
-    }
+    case 'search': case 'fetch':
+      return yield* knowledgeTool(name, input, context);
     case 'site_guide': {
       const data = yield* siteGuide(context);
       return result(data.text, data);
