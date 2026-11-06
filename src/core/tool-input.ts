@@ -2,6 +2,8 @@ import { z } from 'zod';
 
 const slug = z.string().min(1).max(300).refine(value => value !== '.' && value !== '..', 'Use a listing or content slug.');
 const contentType = z.enum(['article', 'news', 'opinion']);
+/** The shape of a company-knowledge id; search emits only ids that fetch will accept. */
+export const KNOWLEDGE_ID = /^(provider|article|news|opinion):[^/:?#\s]+$/;
 export const definitions = {
   search_providers: { description: 'Search technology providers by name, category and city.', inputSchema: {
     q: z.string().min(1).max(200), category: z.string().optional(), location: z.string().optional(), limit: z.number().optional(),
@@ -16,5 +18,7 @@ export const definitions = {
     q: z.string().max(200).optional(), type: contentType.optional(), limit: z.number().optional(),
   } },
   get_content: { description: 'Read an article, news story or opinion piece, with its citation.', inputSchema: { type: contentType, slug } },
+  search: { description: 'Search providers and editorial content for company knowledge.', inputSchema: { query: z.string().min(1).max(200) }, outputSchema: { results: z.array(z.object({ id: z.string(), title: z.string(), url: z.string() })) } },
+  fetch: { description: 'Fetch a provider or editorial result by its search identifier.', inputSchema: { id: z.string().max(310).regex(KNOWLEDGE_ID).refine(value => !['.', '..'].includes(value.split(':')[1]!), 'Use a valid identifier.') }, outputSchema: { id: z.string(), title: z.string(), text: z.string(), url: z.string(), metadata: z.record(z.string(), z.unknown()) } },
   site_guide: { description: 'Read the site guide and its guidance on available content.', inputSchema: {} },
 };

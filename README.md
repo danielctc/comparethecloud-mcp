@@ -80,6 +80,8 @@ npx mcp-remote https://mcp.comparethecloud.net/mcp
 
 | Tool | Purpose | Inputs |
 |---|---|---|
+| `search` | Search providers and editorial content for company knowledge. | `query` (1–200 characters). |
+| `fetch` | Fetch a search result by its identifier. | `id` (`provider:`, `article:`, `news:` or `opinion:` followed by a slug). |
 | `search_providers` | Search providers, with listing links, location, category, tier, short description and website. | `q` (1–200 characters), optional `category`, `location`, `limit` (default 8, clamped to 1–20). |
 | `get_provider` | Read every non-null field supplied for a listing. No contacts are invented. | `slug`. |
 | `similar_providers` | Find similar providers. | `slug`, optional `limit` (default 6, clamped to 1–12). |
@@ -143,6 +145,8 @@ The tools and authentication scripts start and stop their own local dev servers 
 The registry test uses the unmodified official [2025-12-11 schema](https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json), vendored in `test/fixtures/server.schema.json`; it needs no network. The registry description is shorter than the project specification's example because the official schema permits at most 100 characters.
 
 ## Operations
+
+Once the portal shows the domain verification token, set it with `npx wrangler secret put OPENAI_APPS_CHALLENGE`.
 
 `wrangler.jsonc` carries the production `MCP_KEYS` namespace ID and the `SITE` service binding to the `compare-the-cloud` Worker. A namespace ID is a resource name, not a credential; writes still need account auth. For a fresh deployment create your own namespace and swap the ID:
 

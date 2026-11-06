@@ -70,3 +70,13 @@ it('serves mobile-safe landing and registration HTML with security headers', asy
   const form = await worker.fetch(request('/register'), env, createExecutionContext());
   expect(await form.text()).toContain('<form method="post"'); expect(form.headers.get('Cache-Control')).toBe('no-store');
 });
+
+it('serves only the exact OpenAI challenge token when configured', async () => {
+  const { env } = mockEnv();
+  const path = '/.well-known/openai-apps-challenge';
+  expect((await worker.fetch(request(path), env, createExecutionContext())).status).toBe(404);
+  env.OPENAI_APPS_CHALLENGE = 'token with spaces\n';
+  const response = await worker.fetch(request(path), env, createExecutionContext());
+  expect(response.headers.get('Content-Type')).toMatch(/^text\/plain/);
+  expect(await response.text()).toBe(env.OPENAI_APPS_CHALLENGE);
+});

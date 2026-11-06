@@ -47,7 +47,7 @@ it.each(['.', '..'])('rejects path traversal slug %s before making an upstream r
 });
 it('accepts a browser origin for the public, cookie-free API', async () => {
   const { response, data } = await call('tools/list', {}, { Origin: 'https://client.example.test' });
-  expect(response.status).toBe(200); expect(data.result.tools).toHaveLength(8);
+  expect(response.status).toBe(200); expect(data.result.tools).toHaveLength(10);
   expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
 });
 it.each(['null', 'not an origin', 'ftp://example.test', 'https://example.test/path'])('rejects invalid browser origin %s', async origin => {
@@ -66,4 +66,17 @@ it.each([
   expect(response.status).toBe(200); expect(data.result.isError).toBe(true);
   expect(data.result.content[0].text.startsWith(SOURCE)).toBe(true);
   expect(data.result.structuredContent.error).toBeDefined(); expect(fetch).not.toHaveBeenCalled();
+});
+
+it('advertises company knowledge input and output schemas and read-only annotations', async () => {
+  const { data } = await call('tools/list');
+  for (const [name, input, output] of [
+    ['search', ['query'], ['results']],
+    ['fetch', ['id'], ['id', 'title', 'text', 'url', 'metadata']],
+  ] as const) {
+    const tool = data.result.tools.find((entry: { name: string }) => entry.name === name);
+    expect(tool.inputSchema.required).toEqual(input);
+    expect(tool.outputSchema.required).toEqual(output);
+    expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
+  }
 });

@@ -3,6 +3,7 @@
 Read-only tools over the Compare the Cloud directory of UK and European technology providers (cloud,
 hosting, MSP, cybersecurity, AI) and the site's articles, news and expert opinion.
 
+- Search across providers and editorial with `search`, then read a result with `fetch`.
 - Find providers with `search_providers`, open one with `get_provider`, widen with `similar_providers`.
 - Browse `list_categories` and `directory_stats` before narrowing a search.
 - Research with `search_content` and read a piece with `get_content`. Cite as "Compare the Cloud, author, date, URL".

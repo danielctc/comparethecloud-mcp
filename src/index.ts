@@ -38,6 +38,22 @@ const decorate = (response: Response, headers: Record<string, string>) => {
   for (const [key, value] of Object.entries(headers)) wrapped.headers.set(key, value);
   return wrapped;
 };
+/** Discovery documents under /.well-known: the MCP card and the OpenAI plugin-directory domain check. */
+const wellKnown = (path: string, method: string, env: Env): Response | null => {
+  if (path === '/.well-known/mcp.json' && method === 'GET') return Response.json({
+    name: 'Compare the Cloud', description: 'Read-only UK B2B technology directory, articles, news and opinion.',
+    endpoint: `${env.PUBLIC_ORIGIN}/mcp`, transport: 'streamable-http', auth: 'optional bearer key',
+    register: `${env.PUBLIC_ORIGIN}/register`, docs: 'https://github.com/danielctc/comparethecloud-mcp',
+    privacy: `${SITE_URL}/privacy-policy`, contact: `${SITE_URL}/contact`,
+  });
+  if (path === '/.well-known/openai-apps-challenge' && (method === 'GET' || method === 'HEAD')) {
+    // The portal's domain check: the exact token as plain text, never cached, so a rotated secret shows at once.
+    if (!env.OPENAI_APPS_CHALLENGE) return new Response(null, { status: 404 });
+    return new Response(method === 'HEAD' ? null : env.OPENAI_APPS_CHALLENGE,
+      { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+  }
+  return null;
+};
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -81,12 +97,8 @@ export default {
       if (outcome.sent) return html(registrationSuccess());
       return html(outcome.status >= 500 ? registrationFailure() : registrationForm('message' in outcome ? outcome.message : ''), outcome.status);
     }
-    if (path === '/.well-known/mcp.json' && request.method === 'GET') return Response.json({
-      name: 'Compare the Cloud', description: 'Read-only UK B2B technology directory, articles, news and opinion.',
-      endpoint: `${env.PUBLIC_ORIGIN}/mcp`, transport: 'streamable-http', auth: 'optional bearer key',
-      register: `${env.PUBLIC_ORIGIN}/register`, docs: 'https://github.com/danielctc/comparethecloud-mcp',
-      privacy: `${SITE_URL}/privacy-policy`, contact: `${SITE_URL}/contact`,
-    });
+    const discovery = wellKnown(path, request.method, env);
+    if (discovery) return discovery;
     if (['/logo.png', '/logo-512.png', '/logo-400.png'].includes(path) && request.method === 'GET') return env.ASSETS.fetch(request);
     return apiError(404, 'not_found', {});
   },

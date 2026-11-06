@@ -11,6 +11,7 @@ export interface Env {
   RESEND_FROM: string;
   RESEND_API_KEY: string;
   UPSTREAM_SECRET: string;
+  OPENAI_APPS_CHALLENGE?: string;
 }
 
 /** Public site; every upstream URL and every link in tool output derives from it. */

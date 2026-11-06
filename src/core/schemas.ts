@@ -38,3 +38,4 @@ export const ContentSearch = Schema.Struct({ items: Schema.Array(Schema.Struct(C
 export const Content = Schema.Struct({ item: Schema.Struct({
   ...ContentFields, updatedAt: optionalText, text: Schema.String,
 }) });
+

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "comparethecloud",
+  "version": "1.0.0",
+  "description": "Find technology providers and read Compare the Cloud editorial content.",
+  "author": {
+    "name": "Compare the Cloud",
+    "url": "https://www.comparethecloud.net"
+  },
+  "homepage": "https://mcp.comparethecloud.net",
+  "repository": "https://github.com/danielctc/comparethecloud-mcp",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cloud",
+    "technology",
+    "providers",
+    "directory",
+    "news"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Compare the Cloud",
+        "shortDescription": "Find technology providers",
+        "longDescription": "Search the Compare the Cloud technology directory, compare providers and read articles, news and opinion. Listings are supplied by vendors and inclusion is not an endorsement.",
+        "developerName": "Compare the Cloud",
+        "category": "Developer Tools",
+        "capabilities": [
+          "Read"
+        ],
+        "websiteURL": "https://www.comparethecloud.net",
+        "privacyPolicyURL": "https://www.comparethecloud.net/privacy-policy",
+        "termsOfServiceURL": "https://www.comparethecloud.net/terms-and-conditions",
+        "defaultPrompt": [
+          "Find cloud providers in London.",
+          "Find articles about cloud security.",
+          "Show directory statistics."
+        ],
+        "brandColor": "#1A507B",
+        "composerIcon": "./assets/icon.png",
+        "logo": "./assets/logo.png",
+        "logoDark": "./assets/logo-dark.png"
+      },
+      "onboardingSkill": "./skills/get-started/SKILL.md"
+    }
+  }
+}
