@@ -32,7 +32,7 @@ it('returns anonymous rate limiting details with CORS and a retry header', async
   expect(response.status).toBe(429); expect(response.headers.get('Retry-After')).toBe('60');
   expect(response.headers.get('X-CTC-Tier')).toBe('anonymous'); expect(response.headers.get('X-RateLimit-Policy')).toBe('60;w=60');
   expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
-  expect(await response.json()).toEqual({ error: 'rate_limited', retry_after: 60, register: `${origin}/register` });
+  expect(await response.json()).toEqual({ error: 'rate_limited', retry_after: 60, register: `${origin}/register`, contact: 'https://www.comparethecloud.net/contact' });
   expect(env.RL_ANON.limit).toHaveBeenCalledWith({ key: 'ip:192.0.2.15' });
 });
 it('limits registered callers per email, not per key, and returns the higher policy', async () => {

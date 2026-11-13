@@ -1,4 +1,8 @@
+import type { LimitProfile } from './core/limits';
+import type { QuotaCounter } from './core/quota';
+
 export interface Env {
+  /** Hashed keys, registration counters and the deny list (`deny:ip:`, `deny:k:`, `deny:u:`). */
   MCP_KEYS: KVNamespace;
   RL_ANON: RateLimit;
   RL_KEY: RateLimit;
@@ -12,6 +16,10 @@ export interface Env {
   RESEND_API_KEY: string;
   UPSTREAM_SECRET: string;
   OPENAI_APPS_CHALLENGE?: string;
+  /** Daily quota and not-found counter, one object per caller bucket. */
+  QUOTA: DurableObjectNamespace<QuotaCounter>;
+  /** OpenAI's published connector egress manifest; unset means no OpenAI ranges, as in the unit tests. */
+  OPENAI_CONNECTOR_RANGES_URL?: string;
 }
 
 /** Public site; every upstream URL and every link in tool output derives from it. */
@@ -29,4 +37,6 @@ export type Tier = keyof typeof TIERS;
 export interface Caller {
   bucket: string;
   tier: Tier;
+  /** Which quota table row applies; a connector address keeps the anonymous tier's headers. */
+  limits: LimitProfile;
 }

@@ -1,11 +1,17 @@
+import { DEFAULT_MAX_REQUEST_BODY_SIZE, isJsonContentType } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
 import { Effect } from 'effect';
 import { version } from '../package.json';
-import { SITE_URL, TIERS, type Env, type Tier } from './env';
-import { authorise } from './core/keys';
+import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
+import { readUpTo } from './core/body';
+import { connectorRanges } from './core/connectors';
+import { authorise, type AuthDecision } from './core/keys';
+import { callsIn, CONTACT_URL, enforceQuota, refundQuota, REFUSALS, settleLookup, type RpcId, type Usage } from './core/limits';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
+
+export { QuotaCounter } from './core/quota';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -54,6 +60,77 @@ const wellKnown = (path: string, method: string, env: Env): Response | null => {
   }
   return null;
 };
+/** The answer for a caller authorise turned away: on the deny list, an unknown key, or over the minute rate. */
+const refusal = (decision: AuthDecision, headers: Record<string, string>, env: Env) => {
+  const register = `${env.PUBLIC_ORIGIN}/register`;
+  if (decision.status === 403) return apiError(403, 'denied', headers, { contact: CONTACT_URL });
+  if (decision.status !== 429) return apiError(decision.status, decision.error ?? 'error', headers, { register });
+  const retryAfter = TIERS[decision.caller.tier].window;
+  return apiError(429, decision.error ?? 'rate_limited', { ...headers, 'Retry-After': String(retryAfter) },
+    { retry_after: retryAfter, register, contact: CONTACT_URL });
+};
+/** Spend this request's tool calls on the caller's daily quota. Gives a Response when the request must not go
+ *  through, otherwise the time its lookups' not-found slots were reserved at, if any. Only tools/call
+ *  requests spend, so initialise and tools/list never touch the counter, and neither does a body the
+ *  transport will refuse as not JSON. The body is read from a clone: the handler still gets the original. */
+const meter = async (request: Request, env: Env, decision: AuthDecision, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
+  const { caller } = decision;
+  const outcome = await Effect.runPromise(Effect.gen(function* () {
+    // A body too large to read cannot be counted, so it is refused rather than served uncounted. The cap is the
+    // MCP SDK's own transport limit, which it also enforces; this keeps the guarantee if that default changes.
+    const json = request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
+    const calls = callsIn(json ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '');
+    // With the deny list unreadable, only a request that runs no tool goes on: any tool call, batched or not, is
+    // a 503, as it would be for any other storage failure.
+    if (decision.denyListUnchecked && calls.usage.toolCalls > 0) return null;
+    return { calls, verdict: yield* enforceQuota(env, caller, calls.usage) };
+  }).pipe(
+    Effect.catchTag('BodyTooLarge', () => Effect.succeed('too_large' as const)),
+    Effect.catchCause(() => Effect.succeed(null)),
+  ));
+  if (outcome === 'too_large') return apiError(413, 'payload_too_large', headers);
+  if (!outcome) return apiError(503, 'service_unavailable', headers);
+  const { calls, verdict } = outcome;
+  if (verdict.ok) return { usage: calls.usage, reservedAt: verdict.reservedAt };
+  // A JSON-RPC error, so an MCP client shows the message; HTTP 429 and Retry-After stay for everything else.
+  const error = (id: RpcId | null) => ({ jsonrpc: '2.0', id, error: { code: -32000, message: REFUSALS[verdict.quota].message,
+    data: { error: 'quota_exceeded', quota: verdict.quota, retry_after: verdict.retryAfter, contact: REFUSALS[verdict.quota].contact } } });
+  return Response.json(calls.batch ? calls.ids.map(error) : error(calls.ids[0] ?? null),
+    { status: 429, headers: { ...headers, 'Retry-After': String(verdict.retryAfter) } });
+};
+/** Run an admitted, metered request through the MCP handler. */
+const serve = async (request: Request, env: Env, ctx: ExecutionContext, admitted: {
+  origin: URL | null; caller: Caller; headers: Record<string, string>; usage: Usage; reservedAt?: number;
+}) => {
+  const { origin, caller, headers, usage, reservedAt } = admitted;
+  let dispatched = 0;
+  const handler = createMcpHandler(() => createServer({ env, bucket: caller.bucket, waitUntil: promise => ctx.waitUntil(promise),
+    onDispatch: () => { dispatched += 1; },
+    // Settled after the reply rather than before it: the count never changes what this caller receives. Only a
+    // lookup that reserved a slot (connector addresses never do) or a call owed a refund needs the counter.
+    onSettle: ({ lookup, missed, refund }) => {
+      const reserved = lookup ? reservedAt : undefined;
+      const owed = refund.providerProfiles + refund.contentReads > 0;
+      if (reserved === undefined && !owed) return Effect.void;
+      return Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed, reserved, owed ? refund : undefined))));
+    } }), {
+    corsOptions: false,
+    // This public, cookie-free API accepts every valid HTTP(S) browser origin.
+    allowedOriginHostnames: origin ? [origin.hostname] : [],
+    allowedHostnames: [new URL(env.PUBLIC_ORIGIN).hostname, 'localhost', '127.0.0.1', '[::1]'],
+  });
+  try {
+    const response = await handler(request, env, ctx);
+    // The transport validates the whole request (headers, every message in a batch) before it dispatches
+    // anything, and answers a refusal with a 4xx. A refused request ran no tool, so its charge comes back.
+    if (response.status >= 400 && response.status < 500 && dispatched === 0 && usage.toolCalls > 0) {
+      ctx.waitUntil(Effect.runPromise(refundQuota(env, caller, usage, reservedAt)));
+    }
+    return decorate(response, headers);
+  } catch {
+    return apiError(500, 'internal_error', headers);
+  }
+};
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -64,28 +141,19 @@ export default {
       // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
       const origin = browserOrigin(request);
       if (origin === false) return apiError(403, 'invalid_origin', anonymousHeaders);
-      const decision = await Effect.runPromise(authorise(request, env).pipe(
+      const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
+      const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
+        Effect.flatMap(connectors => authorise(request, env, connectors)),
         Effect.catchCause(() => Effect.succeed(null)),
       ));
       // Nothing was verified when authorisation itself failed, so report the anonymous tier.
       if (!decision) return apiError(503, 'service_unavailable', anonymousHeaders);
-      const headers = tierHeaders(decision.caller.tier);
-      if (decision.status !== 200) {
-        const retryAfter = decision.status === 429 ? TIERS[decision.caller.tier].window : undefined;
-        return apiError(decision.status, decision.error ?? 'error', { ...headers, ...(retryAfter ? { 'Retry-After': String(retryAfter) } : {}) },
-          { ...(retryAfter ? { retry_after: retryAfter } : {}), register: `${env.PUBLIC_ORIGIN}/register` });
-      }
-      const handler = createMcpHandler(() => createServer({ env, bucket: decision.caller.bucket, waitUntil: p => ctx.waitUntil(p) }), {
-        corsOptions: false,
-        // This public, cookie-free API accepts every valid HTTP(S) browser origin.
-        allowedOriginHostnames: origin ? [origin.hostname] : [],
-        allowedHostnames: [new URL(env.PUBLIC_ORIGIN).hostname, 'localhost', '127.0.0.1', '[::1]'],
-      });
-      try {
-        return decorate(await handler(request, env, ctx), headers);
-      } catch {
-        return apiError(500, 'internal_error', headers);
-      }
+      const { caller } = decision;
+      const headers = tierHeaders(caller.tier);
+      if (decision.status !== 200) return refusal(decision, headers, env);
+      const metered = await meter(request, env, decision, headers);
+      if (metered instanceof Response) return metered;
+      return serve(request, env, ctx, { origin, caller, headers, ...metered });
     }
     if (path === '/health' && request.method === 'GET') {
       return Response.json({ ok: true, version, upstream: env.SITE_ORIGIN }, { headers: cors });

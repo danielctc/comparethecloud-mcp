@@ -12,6 +12,11 @@ export interface UpstreamContext {
   bucket: string;
   /** Keeps a cache write alive after the response is sent; absent in tests. */
   waitUntil?: (promise: Promise<unknown>) => void;
+  /** Called as each tool call starts, so the Worker knows whether the transport dispatched anything. */
+  onDispatch?: () => void;
+  /** Settles a finished tool call: its lookup's not-found reservation (counting a miss) and, for a call that
+   *  served nothing, its profile or content charge. Never fails. Absent in tests. */
+  onSettle?: (settlement: { lookup: boolean; missed: boolean; refund: { providerProfiles: number; contentReads: number } }) => Effect.Effect<void>;
 }
 
 // A service-binding fetch bypasses the Cloudflare edge cache, so GETs are cached here explicitly.

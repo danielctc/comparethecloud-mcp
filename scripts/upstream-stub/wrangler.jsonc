@@ -1,0 +1,7 @@
+{
+  // A stand-in for the www Worker, run beside the MCP Worker by scripts/check-limits.mjs so the service
+  // binding (SITE -> compare-the-cloud) answers locally. Never deployed.
+  "name": "compare-the-cloud",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-01"
+}

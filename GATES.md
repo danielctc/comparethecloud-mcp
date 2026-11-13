@@ -9,7 +9,7 @@ Scope: public read-only remote MCP server for Compare the Cloud with key registr
   EXPECT: /(Tests|Test Files)\s+\d+ passed/
   EVIDENCE: pending
 
-- [ ] A2: a dev server answers MCP initialise and lists exactly the 8 tools, each with title and readOnlyHint
+- [ ] A2: a dev server answers MCP initialise and lists exactly the 10 tools, each with title and readOnlyHint
   CHECK: node scripts/check-tools.mjs
   EXPECT: TOOLS CHECK PASSED
   EVIDENCE: pending
@@ -37,4 +37,9 @@ Scope: public read-only remote MCP server for Compare the Cloud with key registr
 - [ ] A7: tool text for a missing listing says absence proves nothing, and every tool result carries the untrusted-content source note
   CHECK: npx vitest run test/tools.test.ts
   EXPECT: /Tests\s+\d+ passed/
+  EVIDENCE: pending
+
+- [ ] A8: in workerd, the provider-profile quota trips across one IPv6 /64 with a 429 and the consultant link, the next /64 is unaffected, 30 not-found lookups block an address for an hour, tools/list is exempt, and a KV deny-list address gets 403 (a stand-in www Worker answers the service binding)
+  CHECK: node scripts/check-limits.mjs
+  EXPECT: LIMITS CHECK PASSED
   EVIDENCE: pending
