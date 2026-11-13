@@ -33,6 +33,8 @@ export async function testAuthServer() {
   /** How introspection fails, if it does: a thrown fetch (unreachable) or an HTTP status. */
   let outage: Outage = { kind: 'none' };
   let jwksDown = false;
+  /** While set, JWKS answers wait on it, so a test can hold a fetch in flight. */
+  let jwksHold: Promise<void> | undefined;
   const introspections: URLSearchParams[] = [];
   let jwksFetches = 0;
 
@@ -52,8 +54,9 @@ export async function testAuthServer() {
     return current;
   };
 
-  const jwksRoute = () => {
+  const jwksRoute = async () => {
     jwksFetches += 1;
+    await jwksHold;
     if (jwksDown) throw new TypeError('fetch failed');
     return Response.json({ keys: published.map(entry => entry.jwk) });
   };
@@ -91,6 +94,12 @@ export async function testAuthServer() {
     get jwksFetches() { return jwksFetches; },
     set outage(value: Outage) { outage = value; },
     set jwksDown(value: boolean) { jwksDown = value; },
+    /** Hold every JWKS answer until the returned function is called. */
+    holdJwks: () => {
+      let release = () => {};
+      jwksHold = new Promise(resolve => { release = resolve; });
+      return () => { jwksHold = undefined; release(); };
+    },
     /** A token from someone else's key, under a kid this server publishes or not. */
     forge: async (claims: JWTPayload = {}, kid = current.kid) => mint(claims, { key: await signer(kid), kid }),
     handle: vi.fn(handle),

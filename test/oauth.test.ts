@@ -24,16 +24,22 @@ const setup = (flag: { value?: string } = { value: 'true' }) => {
   mocked.env.CTC_MCP_CLIENT_SECRET = CLIENT.secret;
   return mocked;
 };
-const call = (env: ReturnType<typeof mockEnv>['env'], path: string, init: { token?: string; body?: string; method?: string } = {}) => {
-  const method = init.method ?? 'POST';
+const headersFor = (token?: string) => {
   const headers = new Headers({ 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
     'Mcp-Protocol-Version': '2025-11-25', Host: 'mcp.comparethecloud.net', 'CF-Connecting-IP': '192.0.2.20' });
-  if (init.token !== undefined) headers.set('Authorization', `Bearer ${init.token}`);
+  if (token !== undefined) headers.set('Authorization', `Bearer ${token}`);
+  return headers;
+};
+const call = (env: ReturnType<typeof mockEnv>['env'], path: string, init: { token?: string; body?: string; method?: string } = {}) => {
+  const method = init.method ?? 'POST';
+  const headers = headersFor(init.token);
   const body = method === 'GET' || method === 'OPTIONS' ? null : init.body ?? initialise;
   return worker.fetch(new Request(`${origin}${path}`, { method, headers, body }), env, createExecutionContext());
 };
 const rlKeys = (env: ReturnType<typeof mockEnv>['env']) => vi.mocked(env.RL_KEY.limit).mock.calls.map(([options]) => options.key);
 const authCalls = () => server.handle.mock.calls.length;
+/** Let other requests' timers and I/O run: only Date is ever faked here, so this is real time. */
+const settle = (ms = 50) => new Promise(resolve => setTimeout(resolve, ms));
 const sha256Hex = async (text: string) => Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))).toString('hex');
 
 beforeEach(async () => {
@@ -247,6 +253,91 @@ describe('JWKS', () => {
       expect((await call(env, '/auth/mcp', { token })).status).toBe(401);
     }
     expect(server.jwksFetches).toBe(0);
+  });
+
+  describe('under concurrent requests', () => {
+    /** Start every request with the JWKS answer held, so the first fetch is still in flight when the rest arrive. */
+    const burst = async (env: ReturnType<typeof mockEnv>['env'], tokens: string[]) => {
+      const release = server.holdJwks();
+      const pending = tokens.map(token => call(env, '/auth/mcp', { token }));
+      await settle();
+      release();
+      return (await Promise.all(pending)).map(response => response.status);
+    };
+    it('fetches the keys once for a burst of forged tokens at a cold start', async () => {
+      const { env } = setup();
+      const tokens = await Promise.all(Array.from({ length: 25 }, (_, i) => server.forge({ sub: `user_${i}` })));
+      expect(await burst(env, tokens)).toEqual(Array(25).fill(401));
+      expect(server.jwksFetches).toBe(1);
+      expect(server.introspections).toHaveLength(0);
+    });
+    it('fetches once for a cold-start burst while ctc-auth is down, and holds the 10-second retry', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+      const { env } = setup(); server.jwksDown = true;
+      const tokens = await Promise.all(Array.from({ length: 25 }, (_, i) => server.mint({ sub: `user_${i}` })));
+      expect(await burst(env, tokens)).toEqual(Array(25).fill(503));
+      expect(server.jwksFetches).toBe(1);
+      vi.setSystemTime(new Date('2026-11-13T12:00:05Z'));
+      expect((await call(env, '/auth/mcp', { token: tokens[0] })).status).toBe(503);
+      expect(server.jwksFetches).toBe(1);
+      server.jwksDown = false; vi.setSystemTime(new Date('2026-11-13T12:00:11Z'));
+      expect((await call(env, '/auth/mcp', { token: tokens[0] })).status).toBe(200);
+      expect(server.jwksFetches).toBe(2);
+    });
+    it('refreshes once for a burst when the keys fall due, serving the rest on the keys it holds', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+      const { env } = setup();
+      expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+      vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
+      const tokens = await Promise.all(Array.from({ length: 25 }, (_, i) => server.mint({ sub: `user_${i}` })));
+      expect(await burst(env, tokens)).toEqual(Array(25).fill(200));
+      expect(server.jwksFetches).toBe(2);
+    });
+    it('refetches once for a burst from a just-rotated key: the rest get a retryable 503, never a 401', async () => {
+      const { env } = setup();
+      expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+      await server.rotate(true);
+      const tokens = await Promise.all(Array.from({ length: 5 }, (_, i) => server.mint({ sub: `user_${i}` })));
+      expect((await burst(env, tokens)).toSorted()).toEqual([200, 503, 503, 503, 503]);
+      expect(server.jwksFetches).toBe(2);
+    });
+  });
+});
+
+describe('slow uploads', () => {
+  /** A tools/call whose body arrives in two parts, the second only when `finish` is called. */
+  const slowCall = (env: ReturnType<typeof mockEnv>['env'], token: string) => {
+    const bytes = new TextEncoder().encode(search);
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
+    controller?.enqueue(bytes.slice(0, 16));
+    const response = worker.fetch(new Request(`${origin}/auth/mcp`, { method: 'POST', headers: headersFor(token), body, duplex: 'half' } as RequestInit),
+      env, createExecutionContext());
+    return { response, finish: () => { controller?.enqueue(bytes.slice(16)); controller?.close(); } };
+  };
+  it('authorise once the body has arrived, so a grant withdrawn during the upload stops the tool', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+    const { env } = setup(); const token = await server.mint();
+    expect((await call(env, '/auth/mcp', { token })).status).toBe(200);
+    const served = upstream.mock.calls.length;
+    const upload = slowCall(env, token);
+    await settle();
+    server.revoked.add(token);
+    vi.setSystemTime(new Date('2026-11-13T12:02:00Z'));
+    upload.finish();
+    const response = await upload.response;
+    expect(response.status).toBe(401); expect(response.headers.get('WWW-Authenticate')).toBe(INVALID);
+    expect(upstream.mock.calls.length).toBe(served);
+  });
+  it('still serve a slow upload from a caller whose grant stands', async () => {
+    const { env } = setup(); const token = await server.mint();
+    const served = upstream.mock.calls.length;
+    const upload = slowCall(env, token);
+    await settle();
+    upload.finish();
+    const response = await upload.response;
+    expect(response.status).toBe(200); await response.text();
+    expect(upstream.mock.calls.length).toBeGreaterThan(served);
   });
 });
 
