@@ -7,7 +7,7 @@ import { readUpTo } from './core/body';
 import { connectorRanges } from './core/connectors';
 import { authorise, type AuthDecision } from './core/keys';
 import { callsIn, CONTACT_URL, enforceQuota, refundQuota, REFUSALS, settleLookup, type RpcId, type Usage } from './core/limits';
-import { METADATA_PATH, metadataUrl, oauthEnabled, protectedResourceMetadata, RESOURCE_PATH } from './core/oauth';
+import { METADATA_PATH, metadataUrl, oauthEnabled, protectedResourceMetadata, REQUIRED_SCOPE, RESOURCE_PATH } from './core/oauth';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
@@ -36,6 +36,12 @@ const challenge = (env: Env, headers: Record<string, string>, error?: 'invalid_t
   const errorParam = error === undefined ? '' : `, error="${error}"`;
   return Response.json({ error: error ?? 'unauthorized' }, { status: 401,
     headers: { ...headers, 'WWW-Authenticate': `Bearer resource_metadata="${metadataUrl(env)}"${errorParam}` } });
+};
+/** RFC 6750 section 3.1: a valid token without the scope these tools need. Only /auth/mcp adds the challenge. */
+const scopeRefusal = (env: Env, headers: Record<string, string>, signIn: boolean) => {
+  const challengeHeader = `Bearer error="insufficient_scope", scope="${REQUIRED_SCOPE}", resource_metadata="${metadataUrl(env)}"`;
+  return Response.json({ error: 'insufficient_scope', scope: REQUIRED_SCOPE },
+    { status: 403, headers: signIn ? { ...headers, 'WWW-Authenticate': challengeHeader } : headers });
 };
 const apiError = (status: number, error: string, headers: Record<string, string>, extra: Record<string, unknown> = {}) =>
   Response.json({ error, ...extra }, { status, headers });
@@ -167,6 +173,7 @@ const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, si
   const { caller } = decision;
   const headers = routeHeaders(tierHeaders(caller.tier));
   if (signIn && decision.status === 401) return challenge(env, headers, 'invalid_token');
+  if (decision.error === 'insufficient_scope') return scopeRefusal(env, headers, signIn);
   if (decision.status !== 200) return refusal(decision, headers, env);
   const metered = await meter(request, env, decision, headers);
   if (metered instanceof Response) return metered;

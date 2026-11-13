@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from 'effect';
+import { Effect, Schema } from 'effect';
 import type { Env, Caller } from '../env';
 import { anonymousBucket, inRanges, type Cidr } from './ip';
 import { QUOTAS, type LimitProfile } from './limits';
@@ -59,17 +59,19 @@ const denied = (env: Env, buckets: readonly string[]) => Effect.forEach(
   Effect.catchTag('StorageError', () => Effect.sync(() => { console.error('deny_list_unavailable'); return 'unknown' as const; })),
 );
 /** A credential's quota bucket, or why it gets none. The quota belongs to the person, not the key. */
-type Credential = { bucket: string } | { status: 401 | 429; error: 'invalid_key' | 'rate_limited' };
+type Credential = { bucket: string } | { status: 401 | 403 | 429; error: 'invalid_key' | 'insufficient_scope' | 'rate_limited' };
 const invalid: Credential = { status: 401, error: 'invalid_key' };
 const credentialBucket = Effect.fnUntraced(function* (env: Env, header: string, address: string, addressLimits: LimitProfile): Effect.fn.Return<Credential, StorageError | AuthUnavailable> {
   const match = /^Bearer (ctc_[A-Za-z0-9]{40})$/i.exec(header);
   if (!match && oauthEnabled(env)) {
-    // An OAuth access token or a dashboard key, both vouched for by ctc-auth: the bucket is the user.
-    // A credential only ctc-auth can check costs it a lookup on every cache miss, so misses are metered per
-    // address at the address's own minute rate, on a key apart from its tool calls.
-    const admit = storage(() => env[QUOTAS[addressLimits].binding].limit({ key: `introspect:${address}` })).pipe(Effect.map(rate => rate.success));
-    return yield* identifyBearer(env, header, admit).pipe(
-      Effect.map(identity => Option.match(identity, { onNone: () => invalid, onSome: sub => ({ bucket: `u:${sub}` }) })),
+    // An OAuth access token or a dashboard key, both vouched for by ctc-auth: the bucket is the user. Each
+    // introspection cache miss costs ctc-auth a lookup, so misses are metered: per address, at the address's own
+    // minute rate, for credentials any string can reach; per user for a JWT, whose signature already held.
+    const spend = (limiter: RateLimit, key: string) => storage(() => limiter.limit({ key })).pipe(Effect.map(rate => rate.success));
+    const meters = { address: spend(env[QUOTAS[addressLimits].binding], `introspect:${address}`), user: (sub: string) => spend(env.RL_INTROSPECT, `u:${sub}`) };
+    return yield* identifyBearer(env, header, meters).pipe(
+      Effect.map((verdict): Credential => verdict.kind === 'user' ? { bucket: `u:${verdict.sub}` }
+        : verdict.kind === 'insufficient_scope' ? { status: 403, error: 'insufficient_scope' } : invalid),
       Effect.catchTag('IntrospectionThrottled', () => Effect.succeed<Credential>({ status: 429, error: 'rate_limited' })),
     );
   }
