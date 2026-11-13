@@ -86,6 +86,8 @@ export async function testAuthServer() {
   return {
     mint, rotate, revoked, records, introspections,
     publicKeys: () => published.map(entry => entry.jwk),
+    /** A token's claims, to build an introspection answer that differs from them. */
+    decode: (token: string): Introspected => ({ ...decodeJwt(token), active: true }),
     get jwksFetches() { return jwksFetches; },
     set outage(value: Outage) { outage = value; },
     set jwksDown(value: boolean) { jwksDown = value; },

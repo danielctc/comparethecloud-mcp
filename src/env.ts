@@ -6,6 +6,8 @@ export interface Env {
   MCP_KEYS: KVNamespace;
   RL_ANON: RateLimit;
   RL_KEY: RateLimit;
+  /** Revocation checks for verified JWTs, per user: 120 a minute. */
+  RL_INTROSPECT: RateLimit;
   ASSETS: Fetcher;
   /** Service binding to the www Worker; a plain fetch to the same zone would bypass it. Required: a missing
    *  binding must fail loudly, never fall back to the bypassing path. Tests inject a fetcher. */
