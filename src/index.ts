@@ -1,9 +1,9 @@
 import { DEFAULT_MAX_REQUEST_BODY_SIZE, isJsonContentType } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
-import { Effect } from 'effect';
+import { Effect, type Exit } from 'effect';
 import { version } from '../package.json';
 import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
-import { readUpTo } from './core/body';
+import { readUpTo, type BodyTooLarge, type BodyUnreadable } from './core/body';
 import { connectorRanges } from './core/connectors';
 import { authorise, type AuthDecision } from './core/keys';
 import { callsIn, CONTACT_URL, enforceQuota, refundQuota, REFUSALS, settleLookup, type RpcId, type Usage } from './core/limits';
@@ -92,17 +92,24 @@ const refusal = (decision: AuthDecision, headers: Record<string, string>, env: E
   return apiError(429, decision.error ?? 'rate_limited', { ...headers, 'Retry-After': String(retryAfter) },
     { retry_after: retryAfter, register, contact: CONTACT_URL });
 };
+/** A JSON POST's body, read to the end from a clone before the caller is authorised, so the authorisation that
+ *  admits a request is never older than its upload: a client cannot authenticate, hold the upload open past a
+ *  revocation, and still run a tool. The handler still gets the original. The cap is the MCP SDK's own transport
+ *  limit, which it also enforces; this keeps the guarantee if that default changes. The outcome is held and judged
+ *  only in meter, after every refusal, so which answer a request gets does not change. */
+type Body = Exit.Exit<string, BodyTooLarge | BodyUnreadable>;
+const readBody = (request: Request): Promise<Body> => Effect.runPromise(Effect.exit(Effect.suspend(() =>
+  request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'))
+    ? readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : Effect.succeed(''))));
 /** Spend this request's tool calls on the caller's daily quota. Gives a Response when the request must not go
  *  through, otherwise the time its lookups' not-found slots were reserved at, if any. Only tools/call
  *  requests spend, so initialise and tools/list never touch the counter, and neither does a body the
- *  transport will refuse as not JSON. The body is read from a clone: the handler still gets the original. */
-const meter = async (request: Request, env: Env, decision: AuthDecision, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
+ *  transport will refuse as not JSON. */
+const meter = async (body: Body, env: Env, decision: AuthDecision, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
   const { caller } = decision;
   const outcome = await Effect.runPromise(Effect.gen(function* () {
-    // A body too large to read cannot be counted, so it is refused rather than served uncounted. The cap is the
-    // MCP SDK's own transport limit, which it also enforces; this keeps the guarantee if that default changes.
-    const json = request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
-    const calls = callsIn(json ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '');
+    // A body too large to read cannot be counted, so it is refused rather than served uncounted.
+    const calls = callsIn(yield* body);
     // With the deny list unreadable, only a request that runs no tool goes on: any tool call, batched or not, is
     // a 503, as it would be for any other storage failure.
     if (decision.denyListUnchecked && calls.usage.toolCalls > 0) return null;
@@ -164,6 +171,7 @@ const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, si
   if (origin === false) return apiError(403, 'invalid_origin', routeHeaders(anonymousHeaders));
   // RFC 6750 3.1: a request with no bearer token, including a Basic or empty header, gets the plain challenge.
   if (signIn && !/^Bearer /i.test(request.headers.get('Authorization') ?? '')) return challenge(env, routeHeaders(anonymousHeaders));
+  const body = await readBody(request);
   const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
   const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
     Effect.flatMap(connectors => authorise(request, env, connectors)),
@@ -176,7 +184,7 @@ const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, si
   if (signIn && decision.status === 401) return challenge(env, headers, 'invalid_token');
   if (decision.error === 'insufficient_scope') return scopeRefusal(env, headers, signIn);
   if (decision.status !== 200) return refusal(decision, headers, env);
-  const metered = await meter(request, env, decision, headers);
+  const metered = await meter(body, env, decision, headers);
   if (metered instanceof Response) return metered;
   return serve(request, env, ctx, { origin, caller, headers, ...metered });
 };

@@ -55,6 +55,11 @@ const JWKS_RETRY_MS = 10_000;
 const INTROSPECTION_CACHE_MS = 59_000;
 const MAX_CACHED = 5_000;
 const FETCH_TIMEOUT_MS = 3_000;
+// A request that finds a first JWKS fetch already in flight waits for it on its own timers, checking every 25 ms,
+// for no longer than the fetch itself may take. Counted in polls, not by the clock, so a frozen clock still ends it.
+const JWKS_POLL_MS = 25;
+const JWKS_IN_FLIGHT_MS = FETCH_TIMEOUT_MS + 1_000;
+const JWKS_MAX_POLLS = JWKS_IN_FLIGHT_MS / JWKS_POLL_MS;
 const MAX_RESPONSE_BYTES = 65_536;
 
 export class AuthUnavailable extends Schema.TaggedError<AuthUnavailable>()('AuthUnavailable', {}) {}
@@ -111,15 +116,19 @@ const userSubject = ({ sub, client_id: clientId, azp }: Claims): Option.Option<s
 // junk cannot grow the isolate's memory or push out the answers for real users.
 let jwks: ReturnType<typeof createLocalJWKSet> | undefined;
 /** When the key set is next fetched: 10 minutes after a good fetch, 60 seconds after a failed refresh of keys
- *  already held, 10 seconds after a failed first fetch. */
+ *  already held, 10 seconds after a failed first fetch. The failure deadline is set as a fetch starts. */
 let refreshAt = -Infinity;
 let lastForcedAt = -Infinity;
+/** Until when a fetch this isolate started counts as in flight. A deadline rather than a flag: a request cancelled
+ *  mid-fetch never clears a flag, so its claim lapses by the clock instead. */
+let loadingUntil = -Infinity;
 type AnswerCache = Map<string, { answer: Introspection; until: number }>;
 const jwtAnswers: AnswerCache = new Map();
 const credentialAnswers: AnswerCache = new Map();
 /** Tests start each case with an empty isolate. */
 export const resetOAuthCaches = () => {
-  jwks = undefined; refreshAt = -Infinity; lastForcedAt = -Infinity; jwtAnswers.clear(); credentialAnswers.clear();
+  jwks = undefined; refreshAt = -Infinity; lastForcedAt = -Infinity; loadingUntil = -Infinity;
+  jwtAnswers.clear(); credentialAnswers.clear();
 };
 
 /** A 200 with a body read up to a cap; anything else (no answer, timeout, any other status) is a failure. */
@@ -133,11 +142,27 @@ const fetchText = (input: string, init: RequestInit) => Effect.tryPromise(async 
   Effect.mapError(() => new IntrospectionFailed({})),
 );
 
+/** One JWKS fetch at a time per isolate, so a burst of tokens (forged ones included) at a cold start, a refresh or
+ *  a retry costs ctc-auth one call. A request that finds a fetch in flight serves on the keys it holds; with none,
+ *  it waits for that fetch by re-reading this module's state on its own timers. It never awaits the promise of the
+ *  request that started the fetch: workerd cannot safely resume one request on a promise another request settles
+ *  (cloudflare/workerd#8228). */
 const loadJwks = Effect.fnUntraced(function* (force: boolean) {
-  const now = yield* Clock.currentTimeMillis;
-  const due = force && jwks ? now - lastForcedAt >= JWKS_FORCED_COOLDOWN_MS : now >= refreshAt;
-  if (!due) return jwks ?? (yield* new AuthUnavailable({}));
-  if (force) lastForcedAt = now;
+  let now = yield* Clock.currentTimeMillis;
+  for (let polls = 0; !jwks && now < loadingUntil && polls < JWKS_MAX_POLLS; polls += 1) {
+    yield* Effect.sleep(JWKS_POLL_MS);
+    now = yield* Clock.currentTimeMillis;
+  }
+  // An unknown kid forces a refetch (with keys held, so it is a refetch); anything else waits for refreshAt.
+  const forced = force && jwks !== undefined;
+  if (now < loadingUntil || (forced ? now - lastForcedAt < JWKS_FORCED_COOLDOWN_MS : now < refreshAt)) {
+    return forced || !jwks ? yield* new AuthUnavailable({}) : jwks;
+  }
+  if (forced) lastForcedAt = now;
+  // Claimed before fetching, so every request that arrives meanwhile sees the fetch, and a failure's retry
+  // deadline already stands.
+  loadingUntil = now + JWKS_IN_FLIGHT_MS;
+  refreshAt = now + (jwks ? JWKS_FORCED_COOLDOWN_MS : JWKS_RETRY_MS);
   const fetched = yield* fetchText(JWKS_URL, { headers: { Accept: 'application/json' } }).pipe(
     Effect.flatMap(text => Effect.try({
       // SAFETY: createLocalJWKSet validates the set's shape itself and throws on anything that is not one.
@@ -147,9 +172,10 @@ const loadJwks = Effect.fnUntraced(function* (force: boolean) {
   );
   // A failed refresh keeps the last good keys: they are still the issuer's, and every token is introspected
   // anyway. With none ever fetched there is nothing to verify against, so the request fails closed, and so does a
-  // forced refetch for an unknown kid: the old keys cannot settle whether the token is good.
-  if (Option.isSome(fetched)) jwks = fetched.value;
-  refreshAt = now + (Option.isSome(fetched) ? JWKS_FRESH_MS : jwks ? JWKS_FORCED_COOLDOWN_MS : JWKS_RETRY_MS);
+  // forced refetch for an unknown kid: the old keys cannot settle whether the token is good. The keys and the
+  // end of the claim change together, so a waiting request never sees one without the other.
+  if (Option.isSome(fetched)) { jwks = fetched.value; refreshAt = now + JWKS_FRESH_MS; }
+  loadingUntil = -Infinity;
   if (force && Option.isNone(fetched)) return yield* new AuthUnavailable({});
   return jwks ?? (yield* new AuthUnavailable({}));
 });
@@ -207,10 +233,10 @@ const verifyLocally = Effect.fnUntraced(function* (env: Env, token: string): Eff
     catch: cause => cause,
   })));
   return yield* verify(false).pipe(
-    // An unknown kid is a rotation or a forgery. One refetch a minute settles which; inside that minute the
-    // answer is a retryable 503, so a client holding a token from a just-rotated key does not discard it.
-    Effect.catch(cause => !(cause instanceof errors.JWKSNoMatchingKey) ? Effect.fail(cause)
-      : now - lastForcedAt >= JWKS_FORCED_COOLDOWN_MS ? verify(true) : Effect.fail(new AuthUnavailable({}))),
+    // An unknown kid is a rotation or a forgery. One refetch a minute settles which; inside that minute, or while
+    // a fetch is running, loadJwks answers a retryable 503, so a client holding a token from a just-rotated key
+    // does not discard it.
+    Effect.catch(cause => cause instanceof errors.JWKSNoMatchingKey ? verify(true) : Effect.fail(cause)),
     // A payload whose claims have the wrong types is as bad as a bad signature.
     Effect.map(result => decodeClaims(result.payload)),
     // Only a missing key set is ctc-auth's fault; every other failure is the token's.
