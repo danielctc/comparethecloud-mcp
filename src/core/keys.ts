@@ -69,9 +69,11 @@ export const authorise = Effect.fn('authorise')(function* (request: Request, env
     // The bucket keeps the `k:` prefix because www only accepts `k:` and `ip:` forwarded caller keys.
     caller.bucket = `k:${yield* hashKey(record.email.trim().toLowerCase())}`;
   }
-  // Checked before the limiter, so a denied caller spends nothing. The address entry also covers keyed callers.
-  if (yield* denied(env, [caller.bucket, address])) return { caller, status: 403, error: 'denied' };
+  // The limiter runs first because it is the cheaper check: a flood is cut off at the minute rate without a
+  // KV read per request. The address deny entry also covers keyed callers.
   const limiter = env[QUOTAS[caller.limits].binding];
   const rate = yield* storage(() => limiter.limit({ key: caller.bucket }));
-  return rate.success ? { caller, status: 200 } : { caller, status: 429, error: 'rate_limited' };
+  if (!rate.success) return { caller, status: 429, error: 'rate_limited' };
+  if (yield* denied(env, [caller.bucket, address])) return { caller, status: 403, error: 'denied' };
+  return { caller, status: 200 };
 });

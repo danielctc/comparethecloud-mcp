@@ -12,8 +12,10 @@ await withDevServer(async origin => {
   // Another address in the same IPv6 /64 shares the allowance.
   const refused = await call(origin, '2001:db8:7:7::ffff', 'fetch', { id: 'provider:example' });
   assert.equal(refused.response.status, 429);
-  assert.equal(refused.data.quota, 'provider_profiles');
-  assert.equal(refused.data.contact, 'https://www.comparethecloud.net/consultant');
+  // A JSON-RPC error, so the MCP client shows the message.
+  assert.equal(refused.data.error.data.quota, 'provider_profiles');
+  assert.equal(refused.data.error.data.contact, 'https://www.comparethecloud.net/consultant');
+  assert.ok(refused.data.error.message.includes('/consultant'));
   assert.ok(Number(refused.response.headers.get('Retry-After')) > 0);
   const other = await call(origin, '2001:db8:7:8::1', 'get_provider', { slug: 'example' });
   assert.equal(other.response.status, 200);

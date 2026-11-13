@@ -59,28 +59,39 @@ const consume = Effect.fn('QuotaCounter.consume')(function* (storage: Storage, u
     if (over) return { state, verdict: { ok: false, quota: over[0], retryAfter: seconds((state.day + 1) * DAY_MS - now) } };
     // Each lookup reserves a not-found slot now, before its upstream call, so lookups admitted together (one
     // batch, or concurrent requests) cannot all pass the check and then all miss.
-    if (usage.lookups > 0 && state.misses.length + state.pending.length + usage.lookups > quota.notFoundPerHour) {
-      const freed = Math.min(...state.misses.map(at => at + WINDOW_MS), ...state.pending.map(at => at + PENDING_MS));
-      return { state, verdict: { ok: false, quota: 'not_found_block', retryAfter: seconds(freed - now) } };
+    const limit = quota.notFoundPerHour;
+    const reserving = limit !== null && usage.lookups > 0;
+    const excess = reserving ? state.misses.length + state.pending.length + usage.lookups - limit : 0;
+    if (excess > 0) {
+      // Retry when enough slots are free for the whole request: the excess-th slot to free, as misses leave
+      // the hour and reservations lapse. A batch larger than the whole limit never fits, so it gets one
+      // reservation's life rather than a time that would not help.
+      const frees = [...state.misses.map(at => at + WINDOW_MS), ...state.pending.map(at => at + PENDING_MS)].sort((a, b) => a - b);
+      const freed = frees[excess - 1] ?? now + PENDING_MS;
+      return { state, verdict: { ok: false, quota: 'lookup_slots', retryAfter: seconds(freed - now) } };
     }
     const next = { ...state, toolCalls: state.toolCalls + usage.toolCalls,
       providerProfiles: state.providerProfiles + usage.providerProfiles, contentReads: state.contentReads + usage.contentReads,
-      pending: [...state.pending, ...Array<number>(usage.lookups).fill(now)] };
+      pending: reserving ? [...state.pending, ...Array<number>(usage.lookups).fill(now)] : state.pending };
     storage.kv.put('state', next);
-    return { state: next, verdict: { ok: true } };
+    return { state: next, verdict: reserving ? { ok: true, reservedAt: now } : { ok: true } };
   });
   if (verdict.ok) yield* scheduleCleanup(storage, state);
   return verdict;
 });
 
-/** Release a lookup's reservation; a miss becomes a counted not-found lookup, and the limit's worth blocks. */
-const settleLookup = Effect.fn('QuotaCounter.settleLookup')(function* (storage: Storage, missed: boolean, quota: Quota) {
+/** Release a lookup's own reservation (one made at `reservedAt`; a lapsed one is already gone, and another
+ *  request's is never touched). A miss becomes a counted not-found lookup, and the limit's worth blocks. */
+const settleLookup = Effect.fn('QuotaCounter.settleLookup')(function* (storage: Storage, missed: boolean, quota: Quota, reservedAt: number | undefined) {
+  const limit = quota.notFoundPerHour;
+  if (limit === null) return;
   const now = yield* Clock.currentTimeMillis;
   const state = yield* Effect.sync(() => {
     const state = current(storage, now);
-    const settled = { ...state, pending: state.pending.slice(1) };
+    const own = reservedAt === undefined ? -1 : state.pending.indexOf(reservedAt);
+    const settled = { ...state, pending: own < 0 ? state.pending : state.pending.toSpliced(own, 1) };
     const misses = missed ? [...state.misses, now] : state.misses;
-    const next = misses.length >= quota.notFoundPerHour
+    const next = missed && misses.length >= limit
       ? { ...settled, misses: [], blockedUntil: now + BLOCK_MS }
       : { ...settled, misses };
     storage.kv.put('state', next);
@@ -101,8 +112,8 @@ export class QuotaCounter extends DurableObject<Env> {
   consume(usage: Usage, quota: Quota): Promise<Verdict> {
     return Effect.runPromise(consume(this.ctx.storage, usage, quota));
   }
-  settleLookup(missed: boolean, quota: Quota): Promise<void> {
-    return Effect.runPromise(settleLookup(this.ctx.storage, missed, quota));
+  settleLookup(missed: boolean, quota: Quota, reservedAt?: number): Promise<void> {
+    return Effect.runPromise(settleLookup(this.ctx.storage, missed, quota, reservedAt));
   }
   override alarm(): Promise<void> {
     return Effect.runPromise(cleanup(this.ctx.storage));

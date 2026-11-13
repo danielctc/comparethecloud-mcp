@@ -36,6 +36,14 @@ const setup = () => {
   return { ...mocked, quota, send };
 };
 const repeat = async (times: number, run: () => Promise<void>) => { for (let i = 0; i < times; i++) await run(); };
+interface RpcError { jsonrpc: string; id: number | string | null; error: { code: number; message: string; data: Record<string, unknown> } }
+/** A quota refusal is a JSON-RPC error, so an MCP client shows its message; the details ride in error.data. */
+const refusalOf = async (response: Response) => {
+  const parsed = await response.json() as RpcError | RpcError[];
+  const body = Array.isArray(parsed) ? parsed[0]! : parsed;
+  expect(body.jsonrpc).toBe('2.0'); expect(body.error.code).toBe(-32000);
+  return { ...body.error.data, message: body.error.message, id: body.id, batch: Array.isArray(parsed) ? parsed.length : 0 };
+};
 
 beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T18:00:00Z')); vi.stubGlobal('fetch', upstream); resetConnectorCache(); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -49,8 +57,9 @@ it('refuses the 31st provider profile of the day with 429, Retry-After and the c
   expect(refused.headers.get('Retry-After')).toBe('21600');
   expect(refused.headers.get('X-CTC-Tier')).toBe('anonymous');
   expect(refused.headers.get('Access-Control-Allow-Origin')).toBe('*');
-  const body = await refused.json() as Record<string, string>;
-  expect(body).toMatchObject({ error: 'quota_exceeded', quota: 'provider_profiles', retry_after: 21_600, contact: CONSULTANT_URL });
+  expect(refused.headers.get('Content-Type')).toMatch(/^application\/json/);
+  const body = await refusalOf(refused);
+  expect(body).toMatchObject({ id: 1, error: 'quota_exceeded', quota: 'provider_profiles', retry_after: 21_600, contact: CONSULTANT_URL });
   expect(body.message).toContain(CONSULTANT_URL);
   // Search still works once the profile cap is spent, but it never carries a full description.
   const search = await send(post(message('search_providers', { q: 'cloud' })));
@@ -66,7 +75,7 @@ it('refuses tool calls past the daily limit with the contact link', async () => 
   storage.data.set('state', { ...storage.data.get('state') as object, toolCalls: 2_000 });
   const refused = await send(post(message('search_providers', { q: 'cloud' })));
   expect(refused.status).toBe(429);
-  expect(await refused.json()).toMatchObject({ error: 'quota_exceeded', quota: 'tool_calls', contact: CONTACT_URL });
+  expect(await refusalOf(refused)).toMatchObject({ error: 'quota_exceeded', quota: 'tool_calls', contact: CONTACT_URL });
 });
 
 it('blocks an identity for an hour after 30 not-found lookups', async () => {
@@ -74,7 +83,7 @@ it('blocks an identity for an hour after 30 not-found lookups', async () => {
   await repeat(30, async () => { expect((await send(post(message('get_content', { type: 'article', slug: 'missing' })))).status).toBe(200); });
   const refused = await send(post(message('search_providers', { q: 'cloud' })));
   expect(refused.status).toBe(429); expect(refused.headers.get('Retry-After')).toBe('3600');
-  expect(await refused.json()).toMatchObject({ quota: 'not_found_block', contact: CONTACT_URL });
+  expect(await refusalOf(refused)).toMatchObject({ quota: 'not_found_block', contact: CONTACT_URL });
 });
 
 it('counts every tools/call in a JSON-RPC batch', async () => {
@@ -109,12 +118,18 @@ it('buckets an anonymous IPv6 caller by its /64 for the limiter, the quota and w
 it.each([
   ['an IPv4 address', 'deny:ip:192.0.2.20', '192.0.2.20'],
   ['an IPv6 /64', 'deny:ip:2001:db8:1:2::', '2001:db8:1:2::77'],
-])('refuses %s on the KV deny list before spending a rate-limit token', async (_name, entry, ip) => {
+])('refuses %s on the KV deny list', async (_name, entry, ip) => {
   const { env, values, send } = setup(); values.set(entry, 'abuse report 13 November 2026');
   const response = await send(post({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, { 'CF-Connecting-IP': ip }));
   expect(response.status).toBe(403); expect(await response.json()).toEqual({ error: 'denied', contact: CONTACT_URL });
   expect(response.headers.get('X-CTC-Tier')).toBe('anonymous');
-  expect(env.RL_ANON.limit).not.toHaveBeenCalled();
+  expect(env.RL_ANON.limit).toHaveBeenCalledTimes(1);
+});
+
+it('runs the per-minute limiter before the deny list, so a flood costs no KV read', async () => {
+  const { env, get, send } = setup(); vi.mocked(env.RL_ANON.limit).mockResolvedValue({ success: false });
+  const response = await send(post({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }));
+  expect(response.status).toBe(429); expect(get).not.toHaveBeenCalled();
 });
 
 it('refuses a keyed caller whose identity or address is on the deny list', async () => {
@@ -128,7 +143,7 @@ it('refuses a keyed caller whose identity or address is on the deny list', async
   expect(byIdentity.status).toBe(403); expect(byIdentity.headers.get('X-CTC-Tier')).toBe('registered');
   values.delete(`deny:k:${identity}`); values.set('deny:ip:192.0.2.20', '1');
   expect((await send(post({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, keyed))).status).toBe(403);
-  expect(env.RL_KEY.limit).toHaveBeenCalledTimes(1);
+  expect(env.RL_KEY.limit).toHaveBeenCalledTimes(3);
 });
 
 it('fails closed with 503 when the deny list cannot be read', async () => {
@@ -164,7 +179,8 @@ it('refuses a batch of lookups that would cross the not-found limit before any r
   const { send } = setup(); upstream.mockClear();
   const batch = Array.from({ length: 31 }, (_, i) => message('get_content', { type: 'article', slug: 'missing' }, i + 1));
   const refused = await send(post(batch));
-  expect(refused.status).toBe(429); expect(await refused.json()).toMatchObject({ quota: 'not_found_block' });
+  expect(refused.status).toBe(429); expect(refused.headers.get('Retry-After')).toMatch(/^\d+$/);
+  expect(await refusalOf(refused)).toMatchObject({ quota: 'lookup_slots', retry_after: 60, contact: CONTACT_URL, id: 1, batch: 31 });
   expect(upstream).not.toHaveBeenCalled();
 });
 
@@ -174,5 +190,24 @@ it('lets at most 30 concurrent not-found lookups reach upstream, then blocks', a
   expect(upstream.mock.calls.length).toBeLessThanOrEqual(30);
   expect(responses.filter(response => response.status === 429).length).toBeGreaterThanOrEqual(10);
   const after = await send(post(message('search_providers', { q: 'cloud' })));
-  expect(after.status).toBe(429); expect(await after.json()).toMatchObject({ quota: 'not_found_block' });
+  expect(after.status).toBe(429); expect(await refusalOf(after)).toMatchObject({ quota: 'not_found_block' });
+});
+
+it('never blocks a connector address on not-found lookups, since one user would lock out everyone behind it', async () => {
+  const { send, quota } = setup(); upstream.mockClear();
+  const connector = { 'CF-Connecting-IP': '160.79.104.10' };
+  const responses = await Promise.all(Array.from({ length: 40 }, () => send(post(message('get_content', { type: 'article', slug: 'missing' }), connector))));
+  expect(responses.every(response => response.status === 200)).toBe(true); expect(upstream).toHaveBeenCalledTimes(40);
+  expect((await send(post(message('search_providers', { q: 'cloud' }), connector))).status).toBe(200);
+  expect(quota.objects.get('ip:160.79.104.10')!.storage.data.get('state')).toMatchObject({ misses: [], pending: [] });
+});
+
+it.each([
+  ['a non-JSON Content-Type, which the transport refuses with 415', { 'Content-Type': 'text/plain' }, message('get_provider', { slug: 'example' })],
+  ['a tools/call notification, which has no id and runs nothing', {}, { jsonrpc: '2.0', method: 'tools/call', params: { name: 'get_provider', arguments: { slug: 'example' } } }],
+  ['a message that is not JSON-RPC 2.0', {}, { jsonrpc: '1.0', id: 1, method: 'tools/call', params: { name: 'get_provider', arguments: { slug: 'example' } } }],
+])('charges no quota for %s', async (_name, headers, body) => {
+  const { send, quota } = setup(); upstream.mockClear();
+  const response = await send(post(body, headers));
+  expect(response.status).not.toBe(429); expect(quota.getByName).not.toHaveBeenCalled(); expect(upstream).not.toHaveBeenCalled();
 });

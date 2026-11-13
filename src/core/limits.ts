@@ -1,6 +1,7 @@
+import { isJSONRPCRequest } from '@modelcontextprotocol/server';
 import { Effect, Option, Predicate, Schema } from 'effect';
 import { SITE_URL, TIERS, type Caller, type Env } from '../env';
-import type { ToolName } from './tools';
+import { LOOKUP_TOOLS, type ToolName } from './tools';
 
 export const CONTACT_URL = `${SITE_URL}/contact`;
 export const CONSULTANT_URL = `${SITE_URL}/consultant`;
@@ -12,8 +13,8 @@ export interface Quota {
   binding: 'RL_ANON' | 'RL_KEY';
   /** Per UTC day. */
   toolCalls: number; providerProfiles: number; contentReads: number;
-  /** Not-found lookups allowed in an hour before tool calls are blocked for an hour. */
-  notFoundPerHour: number;
+  /** Not-found lookups allowed in an hour before tool calls are blocked for an hour; null for no block. */
+  notFoundPerHour: number | null;
 }
 /** Every number the abuse limits use. Plan: comparethecloud-mcp-oauth-plan-v1.md section 2, with Daniel's
  *  13 November 2026 change to provider profiles (30 anonymous, 150 signed in). */
@@ -21,40 +22,47 @@ export const QUOTAS = {
   anonymous: { binding: TIERS.anonymous.binding, toolCalls: 2_000, providerProfiles: 30, contentReads: 300, notFoundPerHour: 30 },
   registered: { binding: TIERS.registered.binding, toolCalls: 10_000, providerProfiles: 150, contentReads: 2_000, notFoundPerHour: 30 },
   // One connector address carries many people, so it gets 600 a minute and 20,000 calls a day (plan section 2).
-  // The plan sets no profile, content or not-found numbers for it: these are the anonymous ones scaled 10x
-  // like the call limits, pending Daniel's decision. The anonymous 30 would lock out everyone behind the address.
-  connector: { binding: TIERS.registered.binding, toolCalls: 20_000, providerProfiles: 300, contentReads: 3_000, notFoundPerHour: 300 },
+  // The plan sets no profile or content numbers for it: these are the anonymous ones scaled 10x like the call
+  // limits, pending Daniel's decision. It has no not-found block at all: one user guessing slugs would lock out
+  // everyone behind the address. A per-client limit inside the connector bucket is the follow-up.
+  connector: { binding: TIERS.registered.binding, toolCalls: 20_000, providerProfiles: 300, contentReads: 3_000, notFoundPerHour: null },
 } as const satisfies Record<LimitProfile, Quota>;
 export const NOT_FOUND_WINDOW_SECONDS = 3_600;
 export const NOT_FOUND_BLOCK_SECONDS = 3_600;
 
-export type QuotaName = 'tool_calls' | 'provider_profiles' | 'content_reads' | 'not_found_block';
-export type Verdict = { ok: true } | { ok: false; quota: QuotaName; retryAfter: number };
+export type QuotaName = 'tool_calls' | 'provider_profiles' | 'content_reads' | 'not_found_block' | 'lookup_slots';
+/** `reservedAt` identifies the not-found slots a request's lookups hold, so each settles only its own. */
+export type Verdict = { ok: true; reservedAt?: number } | { ok: false; quota: QuotaName; retryAfter: number };
 /** What a refusal says, and where it sends someone who needs more. */
 export const REFUSALS = {
   tool_calls: { message: `Daily tool-call limit reached. For heavier use, contact Compare the Cloud: ${CONTACT_URL}`, contact: CONTACT_URL },
   provider_profiles: { message: `Daily provider-profile limit reached. For bulk directory research, use Compare the Cloud Consultant: ${CONSULTANT_URL}`, contact: CONSULTANT_URL },
   content_reads: { message: `Daily content-read limit reached. For heavier use, contact Compare the Cloud: ${CONTACT_URL}`, contact: CONTACT_URL },
   not_found_block: { message: `Too many lookups for listings or content that are not published. Tool calls resume after Retry-After. Contact: ${CONTACT_URL}`, contact: CONTACT_URL },
+  lookup_slots: { message: `Too many lookups at once, or too close to the limit on lookups for unpublished records. Send fewer lookups per request and retry after Retry-After. Contact: ${CONTACT_URL}`, contact: CONTACT_URL },
 } as const satisfies Record<QuotaName, { message: string; contact: string }>;
 
 /** What a request would spend. `lookups` are the calls that can come back not found, each of which reserves
  *  a not-found slot until it settles. */
 export interface Usage { toolCalls: number; providerProfiles: number; contentReads: number; lookups: number }
-/** The tools that look one record up by slug or id: a run of misses from them is how slugs get guessed. */
-export const LOOKUP_TOOLS: ReadonlySet<string> = new Set<ToolName>(['get_provider', 'similar_providers', 'get_content', 'fetch']);
 const parseJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 const CONTENT_TYPES = new Set(['article', 'news', 'opinion']);
 const PROFILE_TOOL: ToolName = 'get_provider';
 const CONTENT_TOOL: ToolName = 'get_content';
 const FETCH_TOOL: ToolName = 'fetch';
-/** What one JSON-RPC body would spend. Every `tools/call` counts, batched or not, whatever its params; an
- *  unparseable body spends nothing because the MCP handler refuses it with a parse error. */
-export const usageOf = (body: string): Usage => {
+export type RpcId = string | number;
+/** What one JSON-RPC body would spend, and the ids a refusal must answer. Every `tools/call` request counts,
+ *  batched or not, whatever its params. A body that is not JSON, a notification and a message that is not
+ *  JSON-RPC 2.0 spend nothing: the MCP transport runs no tool for any of them, so charging would only punish
+ *  a broken client. The test is the SDK's own `isJSONRPCRequest`, so the two cannot disagree. */
+export const callsIn = (body: string): { usage: Usage; ids: RpcId[]; batch: boolean } => {
   const usage: Usage = { toolCalls: 0, providerProfiles: 0, contentReads: 0, lookups: 0 };
+  const ids: RpcId[] = [];
   const parsed = Option.getOrUndefined(parseJson(body));
   for (const message of Array.isArray(parsed) ? parsed : [parsed]) {
-    if (!Predicate.isObject(message) || message.method !== 'tools/call') continue;
+    if (!isJSONRPCRequest(message)) continue;
+    ids.push(message.id);
+    if (message.method !== 'tools/call') continue;
     usage.toolCalls += 1;
     const params = Predicate.isObject(message.params) ? message.params : {};
     const args = Predicate.isObject(params.arguments) ? params.arguments : {};
@@ -63,7 +71,7 @@ export const usageOf = (body: string): Usage => {
     if (params.name === CONTENT_TOOL || (fetched !== undefined && CONTENT_TYPES.has(fetched))) usage.contentReads += 1;
     if (Predicate.isString(params.name) && LOOKUP_TOOLS.has(params.name)) usage.lookups += 1;
   }
-  return usage;
+  return { usage, ids, batch: Array.isArray(parsed) };
 };
 
 export class QuotaUnavailable extends Schema.TaggedError<QuotaUnavailable>()('QuotaUnavailable', {}) {}
@@ -78,6 +86,6 @@ export const enforceQuota = Effect.fn('enforceQuota')(function* (env: Env, calle
 });
 /** Settle a lookup's reservation, counting it if it missed. Losing one is better than failing a tool result,
  *  so errors are dropped; an unsettled reservation frees itself within a minute. */
-export const settleLookup = (env: Env, caller: Caller, missed: boolean): Effect.Effect<void> => Effect.tryPromise(
-  () => env.QUOTA.getByName(caller.bucket).settleLookup(missed, QUOTAS[caller.limits]),
+export const settleLookup = (env: Env, caller: Caller, missed: boolean, reservedAt: number | undefined): Effect.Effect<void> => Effect.tryPromise(
+  () => env.QUOTA.getByName(caller.bucket).settleLookup(missed, QUOTAS[caller.limits], reservedAt),
 ).pipe(Effect.ignore);

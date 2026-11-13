@@ -200,3 +200,11 @@ it('leaves a short description untouched', async () => {
   const response = await Effect.runPromise(runTool('search_providers', { q: 'cloud' }, context()));
   expect(response.structuredContent).toEqual({ hits: [{ name: 'Example', slug: 'example', description: 'Short.' }], estimatedTotalHits: 1 });
 });
+
+it('never cuts a description inside a surrogate pair', async () => {
+  const description = `${'a'.repeat(279)}😀${'b'.repeat(500)}`;
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ hits: [{ name: 'Example', slug: 'example', description }], estimatedTotalHits: 1 })));
+  const response = await Effect.runPromise(runTool('search_providers', { q: 'cloud' }, context()));
+  const snippet = (response.structuredContent.hits as { description: string }[])[0]!.description;
+  expect(snippet).toBe(`${'a'.repeat(279)}😀…`);
+});

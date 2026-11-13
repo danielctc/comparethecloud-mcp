@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_REQUEST_BODY_SIZE } from '@modelcontextprotocol/server';
+import { DEFAULT_MAX_REQUEST_BODY_SIZE, isJsonContentType } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
 import { Effect } from 'effect';
 import { version } from '../package.json';
@@ -6,7 +6,7 @@ import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
 import { readUpTo } from './core/body';
 import { connectorRanges } from './core/connectors';
 import { authorise, type AuthDecision } from './core/keys';
-import { CONTACT_URL, enforceQuota, REFUSALS, settleLookup, usageOf, type Verdict } from './core/limits';
+import { callsIn, CONTACT_URL, enforceQuota, REFUSALS, settleLookup, type RpcId } from './core/limits';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
@@ -69,24 +69,30 @@ const refusal = (decision: AuthDecision, headers: Record<string, string>, env: E
   return apiError(429, decision.error ?? 'rate_limited', { ...headers, 'Retry-After': String(retryAfter) },
     { retry_after: retryAfter, register, contact: CONTACT_URL });
 };
-/** Spend this request's tool calls on the caller's daily quota; a Response when it must not go through.
- *  Only tools/call spends, so initialise and tools/list never touch the counter. The body is read from a
- *  clone, so the MCP handler still receives the original bytes. */
-const quotaRefusal = async (request: Request, env: Env, caller: Caller, headers: Record<string, string>) => {
-  const verdict: Verdict | 'too_large' | null = await Effect.runPromise(Effect.gen(function* () {
+/** Spend this request's tool calls on the caller's daily quota. Gives a Response when the request must not go
+ *  through, otherwise the time its lookups' not-found slots were reserved at, if any. Only tools/call
+ *  requests spend, so initialise and tools/list never touch the counter, and neither does a body the
+ *  transport will refuse as not JSON. The body is read from a clone: the handler still gets the original. */
+const meter = async (request: Request, env: Env, caller: Caller, headers: Record<string, string>): Promise<Response | { reservedAt?: number }> => {
+  const outcome = await Effect.runPromise(Effect.gen(function* () {
     // A body too large to read cannot be counted, so it is refused rather than served uncounted. The cap is the
     // MCP SDK's own transport limit, which it also enforces; this keeps the guarantee if that default changes.
-    const body = request.method === 'POST' ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '';
-    return yield* enforceQuota(env, caller, usageOf(body));
+    const json = request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
+    const calls = callsIn(json ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '');
+    return { calls, verdict: yield* enforceQuota(env, caller, calls.usage) };
   }).pipe(
     Effect.catchTag('BodyTooLarge', () => Effect.succeed('too_large' as const)),
     Effect.catchCause(() => Effect.succeed(null)),
   ));
-  if (verdict === 'too_large') return apiError(413, 'payload_too_large', headers);
-  if (!verdict) return apiError(503, 'service_unavailable', headers);
-  if (verdict.ok) return null;
-  return apiError(429, 'quota_exceeded', { ...headers, 'Retry-After': String(verdict.retryAfter) },
-    { quota: verdict.quota, retry_after: verdict.retryAfter, ...REFUSALS[verdict.quota] });
+  if (outcome === 'too_large') return apiError(413, 'payload_too_large', headers);
+  if (!outcome) return apiError(503, 'service_unavailable', headers);
+  const { calls, verdict } = outcome;
+  if (verdict.ok) return { reservedAt: verdict.reservedAt };
+  // A JSON-RPC error, so an MCP client shows the message; HTTP 429 and Retry-After stay for everything else.
+  const error = (id: RpcId | null) => ({ jsonrpc: '2.0', id, error: { code: -32000, message: REFUSALS[verdict.quota].message,
+    data: { error: 'quota_exceeded', quota: verdict.quota, retry_after: verdict.retryAfter, contact: REFUSALS[verdict.quota].contact } } });
+  return Response.json(calls.batch ? calls.ids.map(error) : error(calls.ids[0] ?? null),
+    { status: 429, headers: { ...headers, 'Retry-After': String(verdict.retryAfter) } });
 };
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -108,11 +114,13 @@ export default {
       const { caller } = decision;
       const headers = tierHeaders(caller.tier);
       if (decision.status !== 200) return refusal(decision, headers, env);
-      const overQuota = await quotaRefusal(request, env, caller, headers);
-      if (overQuota) return overQuota;
+      const metered = await meter(request, env, caller, headers);
+      if (metered instanceof Response) return metered;
+      // Only a request whose lookups reserved not-found slots has anything to settle; connector addresses never do.
+      const { reservedAt } = metered;
       const handler = createMcpHandler(() => createServer({ env, bucket: caller.bucket, waitUntil,
         // Settled after the reply rather than before it: the count never changes what this caller receives.
-        onLookup: missed => Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed)))) }), {
+        ...(reservedAt === undefined ? {} : { onLookup: (missed: boolean) => Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed, reservedAt)))) }) }), {
         corsOptions: false,
         // This public, cookie-free API accepts every valid HTTP(S) browser origin.
         allowedOriginHostnames: origin ? [origin.hostname] : [],
