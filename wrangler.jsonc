@@ -29,7 +29,7 @@
     "OPENAI_CONNECTOR_RANGES_URL": "https://openai.com/chatgpt-connectors.json",
     // OAuth sign-in (/auth/mcp and its metadata): off until ctc-auth release/r1, W1 and the ctc-mcp
     // introspection client are live. Only "true" turns it on. Secrets: CTC_MCP_CLIENT_ID, CTC_MCP_CLIENT_SECRET.
-    "OAUTH_ENABLED": "false"
+    "OAUTH_ENABLED": "true"
   },
   "observability": { "enabled": false }
 }
