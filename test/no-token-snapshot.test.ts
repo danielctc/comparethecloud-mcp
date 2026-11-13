@@ -36,8 +36,9 @@ const cases: [string, { body?: string; method?: string; ip?: string }][] = [
   ['connector address tools/call', { body: rpc('tools/call', { name: 'search_providers', arguments: { q: 'cloud' } }), ip: '160.79.104.1' }],
 ];
 afterEach(() => vi.unstubAllGlobals());
-it.each(cases)('no-token %s is byte-identical to the captured response', async (_name, { body, method = 'POST', ip = '192.0.2.10' }) => {
+const capture = async (oauth: string | undefined, { body, method = 'POST', ip = '192.0.2.10' }: { body?: string; method?: string; ip?: string }) => {
   const { env } = mockEnv();
+  env.OAUTH_ENABLED = oauth;
   vi.stubGlobal('fetch', upstream);
   const response = await worker.fetch(new Request('https://mcp.comparethecloud.net/mcp', {
     method, headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
@@ -45,5 +46,13 @@ it.each(cases)('no-token %s is byte-identical to the captured response', async (
     ...(body === undefined ? {} : { body }),
   }), env, createExecutionContext());
   const headers = [...response.headers.entries()].sort(([a], [b]) => a.localeCompare(b));
-  expect({ status: response.status, headers, body: await response.text() }).toMatchSnapshot();
+  return { status: response.status, headers, body: await response.text() };
+};
+it.each(cases)('no-token %s is byte-identical to the captured response', async (_name, request) => {
+  expect(await capture(undefined, request)).toMatchSnapshot();
+});
+// OAuth sign-in must not change what a caller with no token sees on /mcp, so the flag-on answer is compared
+// with the flag-off one directly rather than through a second snapshot that a run could quietly write.
+it.each(cases)('no-token %s is unchanged with OAUTH_ENABLED on', async (_name, request) => {
+  expect(await capture('true', request)).toEqual(await capture(undefined, request));
 });
