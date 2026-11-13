@@ -45,15 +45,17 @@ export const generateKey = Effect.sync(() => {
   return key;
 });
 
-export type AuthDecision = { caller: Caller; status: number; error?: string };
+/** `denyListUnchecked`: the deny list could not be read. The request may go on only if it runs no tool, so a
+ *  KV outage does not take down initialise and tools/list, nor let a denied caller call tools. */
+export type AuthDecision = { caller: Caller; status: number; error?: string; denyListUnchecked?: true };
 /** True when any of the buckets is on the KV deny list. Read on every request, so a ban needs no deploy. */
-/** The deny list is defence in depth behind the limiter and quotas, so a KV failure here fails open (and is
- *  logged for the alert job) rather than taking down tools/list and initialise for every anonymous caller. */
+/** True or false, or 'unknown' when KV could not be read. That is logged for the alert job, and the caller
+ *  decides: only requests that run no tool may go on unchecked (see `denyListUnchecked`). */
 const denied = (env: Env, buckets: readonly string[]) => Effect.forEach(
   [...new Set(buckets)], bucket => storage(() => env.MCP_KEYS.get(`deny:${bucket}`)), { concurrency: 'unbounded' },
 ).pipe(
   Effect.map(entries => entries.some(entry => entry !== null)),
-  Effect.catchTag('StorageError', () => Effect.sync(() => { console.error('deny_list_unavailable'); return false; })),
+  Effect.catchTag('StorageError', () => Effect.sync(() => { console.error('deny_list_unavailable'); return 'unknown' as const; })),
 );
 export const authorise = Effect.fn('authorise')(function* (request: Request, env: Env, connectors: readonly Cidr[]): Effect.fn.Return<AuthDecision, StorageError> {
   const header = request.headers.get('Authorization');
@@ -79,6 +81,7 @@ export const authorise = Effect.fn('authorise')(function* (request: Request, env
   const limiter = env[QUOTAS[caller.limits].binding];
   const rate = yield* storage(() => limiter.limit({ key: caller.bucket }));
   if (!rate.success) return { caller, status: 429, error: 'rate_limited' };
-  if (yield* denied(env, [caller.bucket, address])) return { caller, status: 403, error: 'denied' };
-  return { caller, status: 200 };
+  const deny = yield* denied(env, [caller.bucket, address]);
+  if (deny === true) return { caller, status: 403, error: 'denied' };
+  return deny === 'unknown' ? { caller, status: 200, denyListUnchecked: true } : { caller, status: 200 };
 });

@@ -156,6 +156,18 @@ it('serves anonymous tools/list unchanged when the deny list cannot be read, sin
   expect(error).toHaveBeenCalledWith('deny_list_unavailable');
 });
 
+it.each([
+  ['a tool call', message('search_providers', { q: 'cloud' })],
+  ['a batch containing a tool call', [{ jsonrpc: '2.0', id: 1, method: 'ping', params: {} }, message('search_providers', { q: 'cloud' }, 2)]],
+])('still refuses %s with 503 when the deny list cannot be read', async (_name, body) => {
+  const { get, send, quota } = setup(); get.mockRejectedValue(new Error('private storage diagnostic')); upstream.mockClear();
+  const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  const response = await send(post(body));
+  expect(response.status).toBe(503); expect(await response.json()).toEqual({ error: 'service_unavailable' });
+  expect(upstream).not.toHaveBeenCalled(); expect(quota.getByName).not.toHaveBeenCalled();
+  expect(error).toHaveBeenCalledWith('deny_list_unavailable');
+});
+
 it('gives a published connector address its own 600-a-minute bucket and the connector quota', async () => {
   const { env, send, quota } = setup();
   const connector = { 'CF-Connecting-IP': '160.79.104.10' };

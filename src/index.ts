@@ -73,12 +73,16 @@ const refusal = (decision: AuthDecision, headers: Record<string, string>, env: E
  *  through, otherwise the time its lookups' not-found slots were reserved at, if any. Only tools/call
  *  requests spend, so initialise and tools/list never touch the counter, and neither does a body the
  *  transport will refuse as not JSON. The body is read from a clone: the handler still gets the original. */
-const meter = async (request: Request, env: Env, caller: Caller, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
+const meter = async (request: Request, env: Env, decision: AuthDecision, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
+  const { caller } = decision;
   const outcome = await Effect.runPromise(Effect.gen(function* () {
     // A body too large to read cannot be counted, so it is refused rather than served uncounted. The cap is the
     // MCP SDK's own transport limit, which it also enforces; this keeps the guarantee if that default changes.
     const json = request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
     const calls = callsIn(json ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '');
+    // With the deny list unreadable, only a request that runs no tool goes on: any tool call, batched or not, is
+    // a 503, as it would be for any other storage failure.
+    if (decision.denyListUnchecked && calls.usage.toolCalls > 0) return null;
     return { calls, verdict: yield* enforceQuota(env, caller, calls.usage) };
   }).pipe(
     Effect.catchTag('BodyTooLarge', () => Effect.succeed('too_large' as const)),
@@ -147,7 +151,7 @@ export default {
       const { caller } = decision;
       const headers = tierHeaders(caller.tier);
       if (decision.status !== 200) return refusal(decision, headers, env);
-      const metered = await meter(request, env, caller, headers);
+      const metered = await meter(request, env, decision, headers);
       if (metered instanceof Response) return metered;
       return serve(request, env, ctx, { origin, caller, headers, ...metered });
     }
