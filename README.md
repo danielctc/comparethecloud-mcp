@@ -168,7 +168,7 @@ npx wrangler secret put UPSTREAM_SECRET
 npm run deploy
 ```
 
-Use the same upstream secret on the website. Verify `mcp@comparethecloud.net` as a sender in Resend, and ensure the Cloudflare account owns the `mcp.comparethecloud.net` custom domain. `workers.dev` is disabled. No Durable Objects, D1 or database bindings are required. The Worker uses the stateless Agents MCP handler, `nodejs_compat` and compatibility date `2026-10-01`.
+Use the same upstream secret on the website. Verify `mcp@comparethecloud.net` as a sender in Resend, and ensure the Cloudflare account owns the `mcp.comparethecloud.net` custom domain. `workers.dev` is disabled. The Worker needs one Durable Object class, `QuotaCounter`, bound as `QUOTA` for the daily quotas; its SQLite storage is created by the `v1` migration in `wrangler.jsonc` on the first deploy. No D1 or database bindings are required. The Worker uses the stateless Agents MCP handler, `nodejs_compat` and compatibility date `2026-10-01`.
 
 `SITE_ORIGIN`, `PUBLIC_ORIGIN` and `RESEND_FROM` are ordinary configuration variables. `RESEND_API_KEY` and `UPSTREAM_SECRET` are secrets: supply them using Wrangler, never in source files. `.dev.vars` is ignored; `.dev.vars.example` contains dummy values only. Requests to the website time out after ten seconds, follow no redirects and carry the upstream secret and caller bucket; GET requests request a five-minute Cloudflare cache lifetime.
 

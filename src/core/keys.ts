@@ -47,9 +47,14 @@ export const generateKey = Effect.sync(() => {
 
 export type AuthDecision = { caller: Caller; status: number; error?: string };
 /** True when any of the buckets is on the KV deny list. Read on every request, so a ban needs no deploy. */
+/** The deny list is defence in depth behind the limiter and quotas, so a KV failure here fails open (and is
+ *  logged for the alert job) rather than taking down tools/list and initialise for every anonymous caller. */
 const denied = (env: Env, buckets: readonly string[]) => Effect.forEach(
   [...new Set(buckets)], bucket => storage(() => env.MCP_KEYS.get(`deny:${bucket}`)), { concurrency: 'unbounded' },
-).pipe(Effect.map(entries => entries.some(entry => entry !== null)));
+).pipe(
+  Effect.map(entries => entries.some(entry => entry !== null)),
+  Effect.catchTag('StorageError', () => Effect.sync(() => { console.error('deny_list_unavailable'); return false; })),
+);
 export const authorise = Effect.fn('authorise')(function* (request: Request, env: Env, connectors: readonly Cidr[]): Effect.fn.Return<AuthDecision, StorageError> {
   const header = request.headers.get('Authorization');
   const ip = request.headers.get('CF-Connecting-IP');

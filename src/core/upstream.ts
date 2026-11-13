@@ -14,8 +14,9 @@ export interface UpstreamContext {
   waitUntil?: (promise: Promise<unknown>) => void;
   /** Called as each tool call starts, so the Worker knows whether the transport dispatched anything. */
   onDispatch?: () => void;
-  /** Settles a lookup tool's not-found reservation, counting it if it missed; never fails. Absent in tests. */
-  onLookup?: (missed: boolean) => Effect.Effect<void>;
+  /** Settles a finished tool call: its lookup's not-found reservation (counting a miss) and, for a call that
+   *  served nothing, its profile or content charge. Never fails. Absent in tests. */
+  onSettle?: (settlement: { lookup: boolean; missed: boolean; refund: { providerProfiles: number; contentReads: number } }) => Effect.Effect<void>;
 }
 
 // A service-binding fetch bypasses the Cloudflare edge cache, so GETs are cached here explicitly.

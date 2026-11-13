@@ -1,7 +1,7 @@
 import { isJSONRPCRequest } from '@modelcontextprotocol/server';
 import { Effect, Option, Predicate, Schema } from 'effect';
 import { SITE_URL, TIERS, type Caller, type Env } from '../env';
-import { LOOKUP_TOOLS, type ToolName } from './tools';
+import { chargeOf } from './tools';
 
 export const CONTACT_URL = `${SITE_URL}/contact`;
 export const CONSULTANT_URL = `${SITE_URL}/consultant`;
@@ -46,11 +46,8 @@ export const REFUSALS = {
  *  a not-found slot until it settles. */
 export interface Usage { toolCalls: number; providerProfiles: number; contentReads: number; lookups: number }
 const parseJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
-const CONTENT_TYPES = new Set(['article', 'news', 'opinion']);
-const PROFILE_TOOL: ToolName = 'get_provider';
-const CONTENT_TOOL: ToolName = 'get_content';
-const FETCH_TOOL: ToolName = 'fetch';
 export type RpcId = string | number;
+export interface Refund { providerProfiles: number; contentReads: number }
 /** What one JSON-RPC body would spend, and the ids a refusal must answer. Every `tools/call` request counts,
  *  batched or not, whatever its params. A body that is not JSON, a notification and a message that is not
  *  JSON-RPC 2.0 spend nothing: the MCP transport runs no tool for any of them, so charging would only punish
@@ -65,11 +62,8 @@ export const callsIn = (body: string): { usage: Usage; ids: RpcId[]; batch: bool
     if (message.method !== 'tools/call') continue;
     usage.toolCalls += 1;
     const params = Predicate.isObject(message.params) ? message.params : {};
-    const args = Predicate.isObject(params.arguments) ? params.arguments : {};
-    const fetched = params.name === FETCH_TOOL && Predicate.isString(args.id) ? args.id.split(':')[0] : undefined;
-    if (params.name === PROFILE_TOOL || fetched === 'provider') usage.providerProfiles += 1;
-    if (params.name === CONTENT_TOOL || (fetched !== undefined && CONTENT_TYPES.has(fetched))) usage.contentReads += 1;
-    if (Predicate.isString(params.name) && LOOKUP_TOOLS.has(params.name)) usage.lookups += 1;
+    const charge = chargeOf(params.name, params.arguments);
+    usage.providerProfiles += charge.providerProfiles; usage.contentReads += charge.contentReads; usage.lookups += charge.lookups;
   }
   return { usage, ids, batch: Array.isArray(parsed) };
 };
@@ -89,8 +83,9 @@ export const enforceQuota = Effect.fn('enforceQuota')(function* (env: Env, calle
 export const refundQuota = (env: Env, caller: Caller, usage: Usage, reservedAt: number | undefined): Effect.Effect<void> => Effect.tryPromise(
   () => env.QUOTA.getByName(caller.bucket).refund(usage, reservedAt),
 ).pipe(Effect.ignore);
-/** Settle a lookup's reservation, counting it if it missed. Losing one is better than failing a tool result,
- *  so errors are dropped; an unsettled reservation frees itself within a minute. */
-export const settleLookup = (env: Env, caller: Caller, missed: boolean, reservedAt: number | undefined): Effect.Effect<void> => Effect.tryPromise(
-  () => env.QUOTA.getByName(caller.bucket).settleLookup(missed, QUOTAS[caller.limits], reservedAt),
+/** Settle a finished tool call: release its lookup's reservation (counting a miss), and give back a profile or
+ *  content charge for a call that served nothing. Losing one is better than failing a tool result, so errors
+ *  are dropped; an unsettled reservation frees itself within a minute. */
+export const settleLookup = (env: Env, caller: Caller, missed: boolean, reservedAt: number | undefined, refund?: Refund): Effect.Effect<void> => Effect.tryPromise(
+  () => env.QUOTA.getByName(caller.bucket).settleLookup(missed, QUOTAS[caller.limits], reservedAt, refund),
 ).pipe(Effect.ignore);

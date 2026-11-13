@@ -1,4 +1,4 @@
-import { Effect, Schema } from 'effect';
+import { Effect, Predicate, Schema } from 'effect';
 import { z } from 'zod';
 import { definitions, KNOWLEDGE_ID } from './tool-input';
 import * as S from './schemas';
@@ -148,9 +148,16 @@ const notFound: Partial<Record<ToolName, (input: ToolInput) => string>> = {
   similar_providers: input => `No listing with slug "${oneLine(input.slug)}" to compare against. Absence from the directory says nothing about whether the company exists.`,
   get_content: input => `No published ${oneLine(input.type)} with slug "${oneLine(input.slug)}" on Compare the Cloud. It may be unpublished, renamed or never written.`,
 };
-/** Settle a lookup tool's not-found reservation, taken when the request was admitted. */
-const settle = (name: ToolName, missed: boolean, context: UpstreamContext) =>
-  LOOKUP_TOOLS.has(name) && context.onLookup ? context.onLookup(missed) : Effect.void;
+/** Settle a finished call against what admission charged it: release a lookup's not-found reservation, and
+ *  give back the profile or content charge of a call that served nothing. A not-found answer keeps its charge,
+ *  since probing for slugs is what the charge deters. */
+const settle = (name: ToolName, args: unknown, reply: ToolResult, missed: boolean, context: UpstreamContext) => {
+  const charge = chargeOf(name, args);
+  const servedNothing = reply.isError === true && !missed;
+  const refund = { providerProfiles: servedNothing ? charge.providerProfiles : 0, contentReads: servedNothing ? charge.contentReads : 0 };
+  if (!context.onSettle || (charge.lookups === 0 && refund.providerProfiles + refund.contentReads === 0)) return Effect.void;
+  return context.onSettle({ lookup: charge.lookups > 0, missed, refund });
+};
 /** Run a tool and say whether it was a lookup that came back not found. */
 const attempt = Effect.fn('attemptTool')(function* (name: ToolName, input: ToolInput, context: UpstreamContext) {
   return yield* execute(name, input, context).pipe(
@@ -169,6 +176,19 @@ export const runTool = (name: ToolName, input: ToolInput, context: UpstreamConte
 /** The tools that look one record up by slug or id, the ones with a not-found message: a run of misses from
  *  them is how slugs get guessed, so each reserves a not-found slot when its request is admitted. */
 export const LOOKUP_TOOLS: ReadonlySet<string> = new Set(Object.keys(notFound));
+const CONTENT_TYPES = new Set(['article', 'news', 'opinion']);
+/** What one tool call costs beyond the call itself: a provider profile (get_provider, fetch provider:), a full
+ *  content read (get_content, fetch article:, news:, opinion:), and a not-found slot for any lookup. The one
+ *  rule both the admission charge and the refund for a call that served nothing use. */
+export const chargeOf = (name: unknown, args: unknown) => {
+  const input = Predicate.isObject(args) ? args : {};
+  const fetched = name === 'fetch' && Predicate.isString(input.id) ? input.id.split(':')[0] : undefined;
+  return {
+    providerProfiles: name === 'get_provider' || fetched === 'provider' ? 1 : 0,
+    contentReads: name === 'get_content' || (fetched !== undefined && CONTENT_TYPES.has(fetched)) ? 1 : 0,
+    lookups: Predicate.isString(name) && LOOKUP_TOOLS.has(name) ? 1 : 0,
+  };
+};
 const ToolNameSchema = Schema.Literals(Object.keys(toolTitles) as ToolName[]);
 export const callTool = Effect.fn('callTool')(function* (name: string, args: unknown, context: UpstreamContext) {
   context.onDispatch?.();
@@ -189,7 +209,7 @@ export const callTool = Effect.fn('callTool')(function* (name: string, args: unk
       return outcome;
     });
     // The one place a lookup settles its reservation, whichever way the call above ended.
-    yield* settle(tool, missed, context);
+    yield* settle(tool, args, reply, missed, context);
     return reply;
   }).pipe(
     Effect.catch(() => Effect.succeed(result('Unknown tool. Use tools/list to see available tools.', { error: 'unknown_tool' }, true))),

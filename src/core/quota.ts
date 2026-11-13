@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { Clock, Effect, Option, Schema } from 'effect';
 import type { Env } from '../env';
-import { NOT_FOUND_BLOCK_SECONDS, NOT_FOUND_WINDOW_SECONDS, type Quota, type QuotaName, type Usage, type Verdict } from './limits';
+import { NOT_FOUND_BLOCK_SECONDS, NOT_FOUND_WINDOW_SECONDS, type Quota, type QuotaName, type Refund, type Usage, type Verdict } from './limits';
 
 const DAY_MS = 86_400_000;
 const WINDOW_MS = NOT_FOUND_WINDOW_SECONDS * 1_000;
@@ -84,16 +84,19 @@ const consume = Effect.fn('QuotaCounter.consume')(function* (storage: Storage, u
 
 /** Release a lookup's own reservation (one made at `reservedAt`; a lapsed one is already gone, and another
  *  request's is never touched). A miss becomes a counted not-found lookup, and the limit's worth blocks. */
-const settleLookup = Effect.fn('QuotaCounter.settleLookup')(function* (storage: Storage, missed: boolean, quota: Quota, reservedAt: number | undefined) {
+const settleLookup = Effect.fn('QuotaCounter.settleLookup')(function* (storage: Storage, missed: boolean, quota: Quota, reservedAt: number | undefined, refund: Refund | undefined) {
   const limit = quota.notFoundPerHour;
-  if (limit === null) return;
+  if (limit === null && !refund) return;
   const now = yield* Clock.currentTimeMillis;
   const state = yield* Effect.sync(() => {
     const state = current(storage, now);
-    const own = reservedAt === undefined ? -1 : state.pending.indexOf(reservedAt);
-    const settled = { ...state, pending: own < 0 ? state.pending : state.pending.toSpliced(own, 1) };
-    const misses = missed ? [...state.misses, now] : state.misses;
-    const next = missed && misses.length >= limit
+    // A call that served nothing (an upstream failure, invalid arguments) gives back its profile or content charge.
+    const refunded = refund ? { ...state, providerProfiles: Math.max(0, state.providerProfiles - refund.providerProfiles),
+      contentReads: Math.max(0, state.contentReads - refund.contentReads) } : state;
+    const own = reservedAt === undefined ? -1 : refunded.pending.indexOf(reservedAt);
+    const settled = { ...refunded, pending: own < 0 ? refunded.pending : refunded.pending.toSpliced(own, 1) };
+    const misses = limit !== null && missed ? [...state.misses, now] : state.misses;
+    const next = limit !== null && missed && misses.length >= limit
       ? { ...settled, misses: [], blockedUntil: now + BLOCK_MS }
       : { ...settled, misses };
     storage.kv.put('state', next);
@@ -128,8 +131,8 @@ export class QuotaCounter extends DurableObject<Env> {
   consume(usage: Usage, quota: Quota): Promise<Verdict> {
     return Effect.runPromise(consume(this.ctx.storage, usage, quota));
   }
-  settleLookup(missed: boolean, quota: Quota, reservedAt?: number): Promise<void> {
-    return Effect.runPromise(settleLookup(this.ctx.storage, missed, quota, reservedAt));
+  settleLookup(missed: boolean, quota: Quota, reservedAt?: number, refund?: Refund): Promise<void> {
+    return Effect.runPromise(settleLookup(this.ctx.storage, missed, quota, reservedAt, refund));
   }
   refund(usage: Usage, reservedAt?: number): Promise<void> {
     return Effect.runPromise(refund(this.ctx.storage, usage, reservedAt));

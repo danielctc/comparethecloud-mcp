@@ -146,10 +146,14 @@ it('refuses a keyed caller whose identity or address is on the deny list', async
   expect(env.RL_KEY.limit).toHaveBeenCalledTimes(3);
 });
 
-it('fails closed with 503 when the deny list cannot be read', async () => {
+it('serves anonymous tools/list unchanged when the deny list cannot be read, since the list is defence in depth', async () => {
+  const healthy = setup();
+  const expected = await (await healthy.send(post({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))).text();
   const { get, send } = setup(); get.mockRejectedValue(new Error('private storage diagnostic'));
+  const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
   const response = await send(post({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }));
-  expect(response.status).toBe(503); expect(await response.json()).toEqual({ error: 'service_unavailable' });
+  expect(response.status).toBe(200); expect(await response.text()).toBe(expected);
+  expect(error).toHaveBeenCalledWith('deny_list_unavailable');
 });
 
 it('gives a published connector address its own 600-a-minute bucket and the connector quota', async () => {
@@ -228,4 +232,21 @@ it('refunds a call the transport refuses for a bad Accept header', async () => {
   const response = await send(post(message('get_provider', { slug: 'example' }), { Accept: 'application/json' }));
   expect(response.status).toBe(406); expect(upstream).not.toHaveBeenCalled();
   expect(quota.objects.get('ip:192.0.2.20')!.storage.data.get('state')).toMatchObject({ toolCalls: 0, providerProfiles: 0, pending: [] });
+});
+
+it.each([
+  ['a provider profile on an upstream 503', message('get_provider', { slug: 'example' }), async () => new Response('down', { status: 503 }), { providerProfiles: 0 }],
+  ['a provider profile when upstream is unreachable', message('fetch', { id: 'provider:example' }), async () => { throw new Error('unreachable'); }, { providerProfiles: 0 }],
+  ['a content read on an upstream 500', message('get_content', { type: 'article', slug: 'example' }), async () => new Response('down', { status: 500 }), { contentReads: 0 }],
+])('refunds %s, since nothing was served', async (_name, body, answer, expected) => {
+  const { send, quota } = setup(); vi.stubGlobal('fetch', vi.fn(answer));
+  const response = await send(post(body));
+  expect(response.status).toBe(200);
+  expect(quota.objects.get('ip:192.0.2.20')!.storage.data.get('state')).toMatchObject({ toolCalls: 1, pending: [], ...expected });
+});
+
+it('keeps the profile charge for a lookup that came back not found', async () => {
+  const { send, quota } = setup();
+  await send(post(message('get_provider', { slug: 'missing' })));
+  expect(quota.objects.get('ip:192.0.2.20')!.storage.data.get('state')).toMatchObject({ providerProfiles: 1, misses: [Date.parse('2026-11-13T18:00:00Z')] });
 });

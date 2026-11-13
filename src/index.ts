@@ -102,9 +102,14 @@ const serve = async (request: Request, env: Env, ctx: ExecutionContext, admitted
   let dispatched = 0;
   const handler = createMcpHandler(() => createServer({ env, bucket: caller.bucket, waitUntil: promise => ctx.waitUntil(promise),
     onDispatch: () => { dispatched += 1; },
-    // Only a request whose lookups reserved not-found slots has anything to settle; connector addresses never do.
-    // Settled after the reply rather than before it: the count never changes what this caller receives.
-    ...(reservedAt === undefined ? {} : { onLookup: (missed: boolean) => Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed, reservedAt)))) }) }), {
+    // Settled after the reply rather than before it: the count never changes what this caller receives. Only a
+    // lookup that reserved a slot (connector addresses never do) or a call owed a refund needs the counter.
+    onSettle: ({ lookup, missed, refund }) => {
+      const reserved = lookup ? reservedAt : undefined;
+      const owed = refund.providerProfiles + refund.contentReads > 0;
+      if (reserved === undefined && !owed) return Effect.void;
+      return Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed, reserved, owed ? refund : undefined))));
+    } }), {
     corsOptions: false,
     // This public, cookie-free API accepts every valid HTTP(S) browser origin.
     allowedOriginHostnames: origin ? [origin.hostname] : [],
