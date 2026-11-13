@@ -49,7 +49,9 @@ const consume = Effect.fn('QuotaCounter.consume')(function* (storage: Storage, u
   // this object can run between the check and the increment, so concurrent calls cannot overspend.
   const { state, verdict } = yield* Effect.sync((): Decision => {
     const state = current(storage, now);
-    if (state.blockedUntil > now) return { state, verdict: { ok: false, quota: 'not_found_block', retryAfter: seconds(state.blockedUntil - now) } };
+    // A block applies only under a quota that has one: an address blocked as anonymous while the connector list
+    // was loading is not blocked once it is known to be a connector, where it would lock out everyone behind it.
+    if (quota.notFoundPerHour !== null && state.blockedUntil > now) return { state, verdict: { ok: false, quota: 'not_found_block', retryAfter: seconds(state.blockedUntil - now) } };
     const checks: [QuotaName, number, number, number][] = [
       ['tool_calls', state.toolCalls, usage.toolCalls, quota.toolCalls],
       ['provider_profiles', state.providerProfiles, usage.providerProfiles, quota.providerProfiles],
@@ -100,6 +102,20 @@ const settleLookup = Effect.fn('QuotaCounter.settleLookup')(function* (storage: 
   yield* scheduleCleanup(storage, state);
 });
 
+/** Give back what a request spent when the transport refused it before running any tool. */
+const refund = Effect.fn('QuotaCounter.refund')(function* (storage: Storage, usage: Usage, reservedAt: number | undefined) {
+  const now = yield* Clock.currentTimeMillis;
+  yield* Effect.sync(() => {
+    const state = current(storage, now);
+    let released = 0;
+    const pending = state.pending.filter(at => at !== reservedAt || ++released > usage.lookups);
+    storage.kv.put('state', { ...state, pending,
+      toolCalls: Math.max(0, state.toolCalls - usage.toolCalls),
+      providerProfiles: Math.max(0, state.providerProfiles - usage.providerProfiles),
+      contentReads: Math.max(0, state.contentReads - usage.contentReads) });
+  });
+});
+
 const cleanup = Effect.fn('QuotaCounter.alarm')(function* (storage: Storage) {
   const now = yield* Clock.currentTimeMillis;
   const stored = Option.getOrUndefined(decodeState(storage.kv.get('state')));
@@ -114,6 +130,9 @@ export class QuotaCounter extends DurableObject<Env> {
   }
   settleLookup(missed: boolean, quota: Quota, reservedAt?: number): Promise<void> {
     return Effect.runPromise(settleLookup(this.ctx.storage, missed, quota, reservedAt));
+  }
+  refund(usage: Usage, reservedAt?: number): Promise<void> {
+    return Effect.runPromise(refund(this.ctx.storage, usage, reservedAt));
   }
   override alarm(): Promise<void> {
     return Effect.runPromise(cleanup(this.ctx.storage));

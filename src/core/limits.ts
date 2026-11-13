@@ -84,6 +84,11 @@ export const enforceQuota = Effect.fn('enforceQuota')(function* (env: Env, calle
     catch: () => new QuotaUnavailable({}),
   });
 });
+/** Give back a request's charge when the transport refused it before running any tool. Dropped on error, like
+ *  a settle: the cost of a lost refund is one request's worth of quota, and its reservations lapse anyway. */
+export const refundQuota = (env: Env, caller: Caller, usage: Usage, reservedAt: number | undefined): Effect.Effect<void> => Effect.tryPromise(
+  () => env.QUOTA.getByName(caller.bucket).refund(usage, reservedAt),
+).pipe(Effect.ignore);
 /** Settle a lookup's reservation, counting it if it missed. Losing one is better than failing a tool result,
  *  so errors are dropped; an unsettled reservation frees itself within a minute. */
 export const settleLookup = (env: Env, caller: Caller, missed: boolean, reservedAt: number | undefined): Effect.Effect<void> => Effect.tryPromise(

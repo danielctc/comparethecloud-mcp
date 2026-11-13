@@ -211,3 +211,21 @@ it.each([
   const response = await send(post(body, headers));
   expect(response.status).not.toBe(429); expect(quota.getByName).not.toHaveBeenCalled(); expect(upstream).not.toHaveBeenCalled();
 });
+
+it.each([
+  ['a batch with a message that is not JSON-RPC 2.0', [message('get_provider', { slug: 'example' }), { jsonrpc: '1.0', id: 2, method: 'ping' }]],
+  ['a batch mixing initialize with a tool call', [{ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 't', version: '1' } } }, message('get_provider', { slug: 'example' }, 2)]],
+])('refunds %s that the transport refuses without running anything', async (_name, body) => {
+  const { send, quota } = setup(); upstream.mockClear();
+  const response = await send(post(body));
+  expect(response.status).toBeGreaterThanOrEqual(400); expect(response.status).toBeLessThan(500);
+  expect(upstream).not.toHaveBeenCalled();
+  expect(quota.objects.get('ip:192.0.2.20')?.storage.data.get('state') ?? {}).toMatchObject({ toolCalls: 0, providerProfiles: 0, pending: [] });
+});
+
+it('refunds a call the transport refuses for a bad Accept header', async () => {
+  const { send, quota } = setup(); upstream.mockClear();
+  const response = await send(post(message('get_provider', { slug: 'example' }), { Accept: 'application/json' }));
+  expect(response.status).toBe(406); expect(upstream).not.toHaveBeenCalled();
+  expect(quota.objects.get('ip:192.0.2.20')!.storage.data.get('state')).toMatchObject({ toolCalls: 0, providerProfiles: 0, pending: [] });
+});

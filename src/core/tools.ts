@@ -171,6 +171,7 @@ export const runTool = (name: ToolName, input: ToolInput, context: UpstreamConte
 export const LOOKUP_TOOLS: ReadonlySet<string> = new Set(Object.keys(notFound));
 const ToolNameSchema = Schema.Literals(Object.keys(toolTitles) as ToolName[]);
 export const callTool = Effect.fn('callTool')(function* (name: string, args: unknown, context: UpstreamContext) {
+  context.onDispatch?.();
   return yield* Effect.gen(function* () {
     const tool = yield* Schema.decodeUnknownEffect(ToolNameSchema)(name);
     const { reply, missed } = yield* Effect.gen(function* () {

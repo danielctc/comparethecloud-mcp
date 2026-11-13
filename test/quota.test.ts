@@ -230,3 +230,11 @@ it('keeps no not-found slots or block for a quota without a not-found limit', as
   expect(await quota.consume(content, QUOTAS.connector)).toEqual({ ok: true });
   expect([...objects.values()][0]!.storage.data.get('state')).toMatchObject({ misses: [], pending: [], blockedUntil: 0 });
 });
+
+it('lifts an earlier not-found block once the address is classed as a connector', async () => {
+  const { counter: quota } = counter();
+  await repeat(30, () => quota.settleLookup(true, QUOTAS.anonymous));
+  expect(await quota.consume(call, QUOTAS.anonymous)).toMatchObject({ ok: false, quota: 'not_found_block' });
+  // The OpenAI manifest loads and the same address is now a connector, which has no not-found block.
+  expect(await quota.consume(call, QUOTAS.connector)).toEqual({ ok: true });
+});

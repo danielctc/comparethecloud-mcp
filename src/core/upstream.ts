@@ -12,6 +12,8 @@ export interface UpstreamContext {
   bucket: string;
   /** Keeps a cache write alive after the response is sent; absent in tests. */
   waitUntil?: (promise: Promise<unknown>) => void;
+  /** Called as each tool call starts, so the Worker knows whether the transport dispatched anything. */
+  onDispatch?: () => void;
   /** Settles a lookup tool's not-found reservation, counting it if it missed; never fails. Absent in tests. */
   onLookup?: (missed: boolean) => Effect.Effect<void>;
 }
