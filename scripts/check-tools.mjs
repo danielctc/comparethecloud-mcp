@@ -12,7 +12,7 @@ await withDevServer(async origin => {
   const tools = data.result.tools;
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
     'search_providers', 'get_provider', 'similar_providers', 'list_categories',
-    'directory_stats', 'search_content', 'get_content', 'site_guide',
+    'directory_stats', 'search_content', 'get_content', 'site_guide', 'search', 'fetch',
   ].sort());
   for (const tool of tools) {
     assert.ok(tool.title); assert.ok(tool.annotations.title);
@@ -30,6 +30,6 @@ await withDevServer(async origin => {
     const response = await fetch(`${origin}/${file}`); assert.equal(response.status, 200);
     assert.ok(response.headers.get('Content-Type').includes('image/png')); await response.arrayBuffer();
   }
-  console.log('Initialise, eight annotated tools, site-guide resource, stateless methods and static logos verified.');
+  console.log('Initialise, ten annotated tools, site-guide resource, stateless methods and static logos verified.');
   console.log('TOOLS CHECK PASSED');
 });

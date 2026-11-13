@@ -9,7 +9,7 @@ Scope: public read-only remote MCP server for Compare the Cloud with key registr
   EXPECT: /(Tests|Test Files)\s+\d+ passed/
   EVIDENCE: pending
 
-- [ ] A2: a dev server answers MCP initialise and lists exactly the 8 tools, each with title and readOnlyHint
+- [ ] A2: a dev server answers MCP initialise and lists exactly the 10 tools, each with title and readOnlyHint
   CHECK: node scripts/check-tools.mjs
   EXPECT: TOOLS CHECK PASSED
   EVIDENCE: pending
