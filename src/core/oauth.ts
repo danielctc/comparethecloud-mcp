@@ -60,6 +60,9 @@ const FETCH_TIMEOUT_MS = 3_000;
 const JWKS_POLL_MS = 25;
 const JWKS_IN_FLIGHT_MS = FETCH_TIMEOUT_MS + 1_000;
 const JWKS_MAX_POLLS = JWKS_IN_FLIGHT_MS / JWKS_POLL_MS;
+// At most 32 requests wait on one fetch; any more get a retryable 503 at once, so forged tokens at a cold start
+// cannot pile up timers.
+const JWKS_MAX_WAITERS = 32;
 const MAX_RESPONSE_BYTES = 65_536;
 
 export class AuthUnavailable extends Schema.TaggedError<AuthUnavailable>()('AuthUnavailable', {}) {}
@@ -119,15 +122,22 @@ let jwks: ReturnType<typeof createLocalJWKSet> | undefined;
  *  already held, 10 seconds after a failed first fetch. The failure deadline is set as a fetch starts. */
 let refreshAt = -Infinity;
 let lastForcedAt = -Infinity;
+/** Until when a failed fetch may not be retried, scheduled or forced: 60 seconds with keys held, 10 with none.
+ *  Cleared by a good fetch, so a rotation after one is still picked up at once. */
+let retryAt = -Infinity;
 /** Until when a fetch this isolate started counts as in flight. A deadline rather than a flag: a request cancelled
  *  mid-fetch never clears a flag, so its claim lapses by the clock instead. */
 let loadingUntil = -Infinity;
+/** Requests waiting on the fetch in flight. Reset when a fetch is claimed, and a waiter counts itself out only
+ *  while the fetch it waited on is still the one in flight, so neither a cancelled waiter nor a late one skews
+ *  the count for the next fetch. */
+let jwksWaiters = 0;
 type AnswerCache = Map<string, { answer: Introspection; until: number }>;
 const jwtAnswers: AnswerCache = new Map();
 const credentialAnswers: AnswerCache = new Map();
 /** Tests start each case with an empty isolate. */
 export const resetOAuthCaches = () => {
-  jwks = undefined; refreshAt = -Infinity; lastForcedAt = -Infinity; loadingUntil = -Infinity;
+  jwks = undefined; refreshAt = -Infinity; lastForcedAt = -Infinity; retryAt = -Infinity; loadingUntil = -Infinity; jwksWaiters = 0;
   jwtAnswers.clear(); credentialAnswers.clear();
 };
 
@@ -147,22 +157,38 @@ const fetchText = (input: string, init: RequestInit) => Effect.tryPromise(async 
  *  it waits for that fetch by re-reading this module's state on its own timers. It never awaits the promise of the
  *  request that started the fetch: workerd cannot safely resume one request on a promise another request settles
  *  (cloudflare/workerd#8228). */
-const loadJwks = Effect.fnUntraced(function* (force: boolean) {
-  let now = yield* Clock.currentTimeMillis;
+const pollLoad = Effect.fnUntraced(function* (now: number) {
   for (let polls = 0; !jwks && now < loadingUntil && polls < JWKS_MAX_POLLS; polls += 1) {
     yield* Effect.sleep(JWKS_POLL_MS);
     now = yield* Clock.currentTimeMillis;
   }
-  // An unknown kid forces a refetch (with keys held, so it is a refetch); anything else waits for refreshAt.
+  return now;
+});
+/** The time to judge a load at. With no keys and a fetch in flight, that is once the fetch is over: at most 32
+ *  requests wait for it, and the rest get a retryable 503 at once. */
+const awaitLoad = Effect.fnUntraced(function* () {
+  const now = yield* Clock.currentTimeMillis;
+  if (jwks || now >= loadingUntil) return now;
+  if (jwksWaiters >= JWKS_MAX_WAITERS) return yield* new AuthUnavailable({});
+  const claim = loadingUntil;
+  jwksWaiters += 1;
+  return yield* pollLoad(now).pipe(Effect.ensuring(Effect.sync(() => { if (loadingUntil === claim) jwksWaiters -= 1; })));
+});
+const loadJwks = Effect.fnUntraced(function* (force: boolean) {
+  const now = yield* awaitLoad();
+  // An unknown kid forces a refetch (with keys held, so it is a refetch), at most once a minute and never inside
+  // a failed fetch's backoff; anything else waits for refreshAt.
   const forced = force && jwks !== undefined;
-  if (now < loadingUntil || (forced ? now - lastForcedAt < JWKS_FORCED_COOLDOWN_MS : now < refreshAt)) {
+  if (now < loadingUntil || (forced ? now - lastForcedAt < JWKS_FORCED_COOLDOWN_MS || now < retryAt : now < refreshAt)) {
     return forced || !jwks ? yield* new AuthUnavailable({}) : jwks;
   }
   if (forced) lastForcedAt = now;
   // Claimed before fetching, so every request that arrives meanwhile sees the fetch, and a failure's retry
   // deadline already stands.
   loadingUntil = now + JWKS_IN_FLIGHT_MS;
-  refreshAt = now + (jwks ? JWKS_FORCED_COOLDOWN_MS : JWKS_RETRY_MS);
+  jwksWaiters = 0;
+  retryAt = now + (jwks ? JWKS_FORCED_COOLDOWN_MS : JWKS_RETRY_MS);
+  refreshAt = retryAt;
   const fetched = yield* fetchText(JWKS_URL, { headers: { Accept: 'application/json' } }).pipe(
     Effect.flatMap(text => Effect.try({
       // SAFETY: createLocalJWKSet validates the set's shape itself and throws on anything that is not one.
@@ -174,7 +200,7 @@ const loadJwks = Effect.fnUntraced(function* (force: boolean) {
   // anyway. With none ever fetched there is nothing to verify against, so the request fails closed, and so does a
   // forced refetch for an unknown kid: the old keys cannot settle whether the token is good. The keys and the
   // end of the claim change together, so a waiting request never sees one without the other.
-  if (Option.isSome(fetched)) { jwks = fetched.value; refreshAt = now + JWKS_FRESH_MS; }
+  if (Option.isSome(fetched)) { jwks = fetched.value; refreshAt = now + JWKS_FRESH_MS; retryAt = -Infinity; }
   loadingUntil = -Infinity;
   if (force && Option.isNone(fetched)) return yield* new AuthUnavailable({});
   return jwks ?? (yield* new AuthUnavailable({}));

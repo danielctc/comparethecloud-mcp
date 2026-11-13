@@ -319,29 +319,31 @@ describe('JWKS', () => {
       expect(server.jwksFetches).toBe(1);
     });
   });
-  describe('after a failed fetch', () => {
-    it('does not refetch for an unknown kid in the same request whose scheduled refresh just failed', async () => {
-      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
-      const { env } = setup();
-      expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
-      server.jwksDown = true; vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
-      expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(503);
-      expect(server.jwksFetches).toBe(2);
-    });
-    it('holds the failure backoff for an unknown kid that follows a failed scheduled refresh', async () => {
-      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
-      const { env } = setup();
-      expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
-      server.jwksDown = true; vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
-      expect((await call(env, '/auth/mcp', { token: await server.mint({ sub: 'user_2' }) })).status).toBe(200);
-      expect(server.jwksFetches).toBe(2);
-      vi.setSystemTime(new Date('2026-11-13T12:11:30Z'));
-      expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(503);
-      expect(server.jwksFetches).toBe(2);
-      server.jwksDown = false; vi.setSystemTime(new Date('2026-11-13T12:12:01Z'));
-      expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(401);
-      expect(server.jwksFetches).toBe(3);
-    });
+});
+
+describe('JWKS after a failed fetch', () => {
+  it('does not refetch for an unknown kid in the same request whose scheduled refresh just failed', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+    const { env } = setup();
+    expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+    server.jwksDown = true; vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
+    expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(503);
+    expect(server.jwksFetches).toBe(2);
+  });
+  it('holds the failure backoff for an unknown kid that follows a failed scheduled refresh', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+    const { env } = setup();
+    expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+    server.jwksDown = true; vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
+    expect((await call(env, '/auth/mcp', { token: await server.mint({ sub: 'user_2' }) })).status).toBe(200);
+    expect(server.jwksFetches).toBe(2);
+    vi.setSystemTime(new Date('2026-11-13T12:11:30Z'));
+    expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(503);
+    expect(server.jwksFetches).toBe(2);
+    // Once the backoff ends: the scheduled refresh, then the unknown kid's own refetch.
+    server.jwksDown = false; vi.setSystemTime(new Date('2026-11-13T12:12:01Z'));
+    expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(401);
+    expect(server.jwksFetches).toBe(4);
   });
 });
 

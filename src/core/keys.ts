@@ -82,13 +82,15 @@ const credentialBucket = Effect.fnUntraced(function* (env: Env, header: string, 
   // `k:` and `ip:` forwarded caller keys (`u:` once W1 ships).
   return { bucket: `k:${yield* hashKey(record.email.trim().toLowerCase())}` };
 });
+/** The address bucket: an IPv4 address or an IPv6 /64. A published connector address keeps it as its bucket but
+ *  gets the connector limits, because many people share it. */
+const addressOf = (request: Request, connectors: readonly Cidr[]) => {
+  const ip = request.headers.get('CF-Connecting-IP');
+  return { address: anonymousBucket(ip), addressLimits: ip !== null && inRanges(ip, connectors) ? 'connector' as const : 'anonymous' as const };
+};
 export const authorise = Effect.fn('authorise')(function* (request: Request, env: Env, connectors: readonly Cidr[]): Effect.fn.Return<AuthDecision, StorageError | AuthUnavailable> {
   const header = request.headers.get('Authorization');
-  const ip = request.headers.get('CF-Connecting-IP');
-  // The address bucket: an IPv4 address or an IPv6 /64. A published connector address keeps it as its
-  // bucket but gets the connector limits, because many people share it.
-  const address = anonymousBucket(ip);
-  const addressLimits = ip !== null && inRanges(ip, connectors) ? 'connector' : 'anonymous';
+  const { address, addressLimits } = addressOf(request, connectors);
   const caller: Caller = header !== null
     ? { tier: 'registered', limits: 'registered', bucket: '' }
     : { tier: 'anonymous', limits: addressLimits, bucket: address };
@@ -105,4 +107,16 @@ export const authorise = Effect.fn('authorise')(function* (request: Request, env
   const deny = yield* denied(env, [caller.bucket, address]);
   if (deny === true) return { caller, status: 403, error: 'denied' };
   return deny === 'unknown' ? { caller, status: 200, denyListUnchecked: true } : { caller, status: 200 };
+});
+/** An admitted caller's credential, checked again once its upload has arrived, so a grant withdrawn or a key revoked
+ *  while the body came in is refused before any tool runs. Only the credential: the minute rate and the deny list
+ *  were settled on admission, and spending the rate again would charge the caller twice. A JWT's re-check is
+ *  normally an introspection cache hit. */
+export const recheck = Effect.fn('recheck')(function* (request: Request, env: Env, connectors: readonly Cidr[], admitted: AuthDecision): Effect.fn.Return<AuthDecision, StorageError | AuthUnavailable> {
+  const header = request.headers.get('Authorization');
+  if (header === null) return admitted;
+  const { address, addressLimits } = addressOf(request, connectors);
+  const credential = yield* credentialBucket(env, header, address, addressLimits);
+  if ('status' in credential) return { caller: admitted.caller, ...credential };
+  return credential.bucket === admitted.caller.bucket ? admitted : { caller: admitted.caller, ...invalid };
 });

@@ -5,7 +5,8 @@ import { version } from '../package.json';
 import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
 import { readUpTo, type BodyTooLarge, type BodyUnreadable } from './core/body';
 import { connectorRanges } from './core/connectors';
-import { authorise, type AuthDecision } from './core/keys';
+import type { Cidr } from './core/ip';
+import { authorise, recheck, type AuthDecision } from './core/keys';
 import { callsIn, CONTACT_URL, enforceQuota, refundQuota, REFUSALS, settleLookup, type RpcId, type Usage } from './core/limits';
 import { METADATA_PATH, metadataUrl, oauthEnabled, protectedResourceMetadata, REQUIRED_SCOPE, RESOURCE_PATH } from './core/oauth';
 import { registerSafely } from './core/registration';
@@ -92,15 +93,18 @@ const refusal = (decision: AuthDecision, headers: Record<string, string>, env: E
   return apiError(429, decision.error ?? 'rate_limited', { ...headers, 'Retry-After': String(retryAfter) },
     { retry_after: retryAfter, register, contact: CONTACT_URL });
 };
-/** A JSON POST's body, read to the end from a clone before the caller is authorised, so the authorisation that
- *  admits a request is never older than its upload: a client cannot authenticate, hold the upload open past a
- *  revocation, and still run a tool. The handler still gets the original. The cap is the MCP SDK's own transport
- *  limit, which it also enforces; this keeps the guarantee if that default changes. The outcome is held and judged
- *  only in meter, after every refusal, so which answer a request gets does not change. */
+/** How long an admitted caller has to finish its upload before it gets 408. */
+const UPLOAD_DEADLINE_MS = 10_000;
+const hasJsonBody = (request: Request) => request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
+/** A JSON POST's body, read to the end from a clone once the caller is admitted, within the upload deadline. The
+ *  handler still gets the original. The cap is the MCP SDK's own transport limit, which it also enforces; this
+ *  keeps the guarantee if that default changes. Too large or unreadable is judged in meter. */
 type Body = Exit.Exit<string, BodyTooLarge | BodyUnreadable>;
-const readBody = (request: Request): Promise<Body> => Effect.runPromise(Effect.exit(Effect.suspend(() =>
-  request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'))
-    ? readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : Effect.succeed(''))));
+const readBody = (request: Request): Promise<Body | 'timed_out'> => Effect.runPromise(Effect.suspend(() =>
+  hasJsonBody(request) ? readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : Effect.succeed('')).pipe(
+  Effect.exit,
+  Effect.timeoutOrElse({ duration: UPLOAD_DEADLINE_MS, orElse: () => Effect.succeed('timed_out' as const) }),
+));
 /** Spend this request's tool calls on the caller's daily quota. Gives a Response when the request must not go
  *  through, otherwise the time its lookups' not-found slots were reserved at, if any. Only tools/call
  *  requests spend, so initialise and tools/list never touch the counter, and neither does a body the
@@ -171,19 +175,35 @@ const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, si
   if (origin === false) return apiError(403, 'invalid_origin', routeHeaders(anonymousHeaders));
   // RFC 6750 3.1: a request with no bearer token, including a Basic or empty header, gets the plain challenge.
   if (signIn && !/^Bearer /i.test(request.headers.get('Authorization') ?? '')) return challenge(env, routeHeaders(anonymousHeaders));
-  const body = await readBody(request);
   const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-  const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
-    Effect.flatMap(connectors => authorise(request, env, connectors)),
-    Effect.catchCause(() => Effect.succeed(null)),
-  ));
+  /** An authorisation step; null when it could not be finished. */
+  const decide = (step: (connectors: readonly Cidr[]) => Effect.Effect<AuthDecision, unknown>) =>
+    Effect.runPromise(connectorRanges(env, waitUntil).pipe(Effect.flatMap(step), Effect.catchCause(() => Effect.succeed(null))));
   // Nothing was verified when authorisation itself failed, so report the anonymous tier.
-  if (!decision) return apiError(503, 'service_unavailable', routeHeaders(anonymousHeaders));
-  const { caller } = decision;
+  const unavailable = () => apiError(503, 'service_unavailable', routeHeaders(anonymousHeaders));
+  /** The answer for a caller turned away, or null when it may go on. */
+  const turnedAway = (decision: AuthDecision): Response | null => {
+    const headers = routeHeaders(tierHeaders(decision.caller.tier));
+    if (signIn && decision.status === 401) return challenge(env, headers, 'invalid_token');
+    if (decision.error === 'insufficient_scope') return scopeRefusal(env, headers, signIn);
+    return decision.status === 200 ? null : refusal(decision, headers, env);
+  };
+  // Admission comes from the headers alone (minute rate, deny list, credential), so a caller refused for any of
+  // them never has a byte of its upload read.
+  const admitted = await decide(connectors => authorise(request, env, connectors));
+  if (!admitted) return unavailable();
+  const refused = turnedAway(admitted);
+  if (refused) return refused;
+  const { caller } = admitted;
   const headers = routeHeaders(tierHeaders(caller.tier));
-  if (signIn && decision.status === 401) return challenge(env, headers, 'invalid_token');
-  if (decision.error === 'insufficient_scope') return scopeRefusal(env, headers, signIn);
-  if (decision.status !== 200) return refusal(decision, headers, env);
+  const body = await readBody(request);
+  if (body === 'timed_out') return apiError(408, 'request_timeout', headers);
+  // The credential again once the upload is in, so a grant withdrawn or a key revoked while it arrived stops the
+  // request before any tool runs. A request with no body had nothing to wait for.
+  const decision = hasJsonBody(request) ? await decide(connectors => recheck(request, env, connectors, admitted)) : admitted;
+  if (!decision) return unavailable();
+  const refusedAfterUpload = turnedAway(decision);
+  if (refusedAfterUpload) return refusedAfterUpload;
   const metered = await meter(body, env, decision, headers);
   if (metered instanceof Response) return metered;
   return serve(request, env, ctx, { origin, caller, headers, ...metered });
