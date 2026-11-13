@@ -38,7 +38,11 @@ export const REFUSALS = {
   not_found_block: { message: `Too many lookups for listings or content that are not published. Tool calls resume after Retry-After. Contact: ${CONTACT_URL}`, contact: CONTACT_URL },
 } as const satisfies Record<QuotaName, { message: string; contact: string }>;
 
-export interface Usage { toolCalls: number; providerProfiles: number; contentReads: number }
+/** What a request would spend. `lookups` are the calls that can come back not found, each of which reserves
+ *  a not-found slot until it settles. */
+export interface Usage { toolCalls: number; providerProfiles: number; contentReads: number; lookups: number }
+/** The tools that look one record up by slug or id: a run of misses from them is how slugs get guessed. */
+export const LOOKUP_TOOLS: ReadonlySet<string> = new Set<ToolName>(['get_provider', 'similar_providers', 'get_content', 'fetch']);
 const parseJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 const CONTENT_TYPES = new Set(['article', 'news', 'opinion']);
 const PROFILE_TOOL: ToolName = 'get_provider';
@@ -47,7 +51,7 @@ const FETCH_TOOL: ToolName = 'fetch';
 /** What one JSON-RPC body would spend. Every `tools/call` counts, batched or not, whatever its params; an
  *  unparseable body spends nothing because the MCP handler refuses it with a parse error. */
 export const usageOf = (body: string): Usage => {
-  const usage: Usage = { toolCalls: 0, providerProfiles: 0, contentReads: 0 };
+  const usage: Usage = { toolCalls: 0, providerProfiles: 0, contentReads: 0, lookups: 0 };
   const parsed = Option.getOrUndefined(parseJson(body));
   for (const message of Array.isArray(parsed) ? parsed : [parsed]) {
     if (!Predicate.isObject(message) || message.method !== 'tools/call') continue;
@@ -57,6 +61,7 @@ export const usageOf = (body: string): Usage => {
     const fetched = params.name === FETCH_TOOL && Predicate.isString(args.id) ? args.id.split(':')[0] : undefined;
     if (params.name === PROFILE_TOOL || fetched === 'provider') usage.providerProfiles += 1;
     if (params.name === CONTENT_TOOL || (fetched !== undefined && CONTENT_TYPES.has(fetched))) usage.contentReads += 1;
+    if (Predicate.isString(params.name) && LOOKUP_TOOLS.has(params.name)) usage.lookups += 1;
   }
   return usage;
 };
@@ -71,7 +76,8 @@ export const enforceQuota = Effect.fn('enforceQuota')(function* (env: Env, calle
     catch: () => new QuotaUnavailable({}),
   });
 });
-/** Count a not-found lookup. Losing one count is better than failing a tool result, so errors are dropped. */
-export const recordNotFound = (env: Env, caller: Caller): Effect.Effect<void> => Effect.tryPromise(
-  () => env.QUOTA.getByName(caller.bucket).recordNotFound(QUOTAS[caller.limits]),
+/** Settle a lookup's reservation, counting it if it missed. Losing one is better than failing a tool result,
+ *  so errors are dropped; an unsettled reservation frees itself within a minute. */
+export const settleLookup = (env: Env, caller: Caller, missed: boolean): Effect.Effect<void> => Effect.tryPromise(
+  () => env.QUOTA.getByName(caller.bucket).settleLookup(missed, QUOTAS[caller.limits]),
 ).pipe(Effect.ignore);

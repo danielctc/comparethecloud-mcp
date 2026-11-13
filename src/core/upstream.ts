@@ -12,9 +12,8 @@ export interface UpstreamContext {
   bucket: string;
   /** Keeps a cache write alive after the response is sent; absent in tests. */
   waitUntil?: (promise: Promise<unknown>) => void;
-  /** Counts a lookup for something not published towards the caller's not-found block; never fails.
-   *  Absent in tests. */
-  onNotFound?: Effect.Effect<void>;
+  /** Settles a lookup tool's not-found reservation, counting it if it missed; never fails. Absent in tests. */
+  onLookup?: (missed: boolean) => Effect.Effect<void>;
 }
 
 // A service-binding fetch bypasses the Cloudflare edge cache, so GETs are cached here explicitly.

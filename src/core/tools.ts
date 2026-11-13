@@ -1,6 +1,7 @@
 import { Effect, Schema } from 'effect';
 import { z } from 'zod';
 import { definitions, KNOWLEDGE_ID } from './tool-input';
+import { LOOKUP_TOOLS } from './limits';
 import * as S from './schemas';
 import { SITE_URL } from '../env';
 import { siteGuide, truncate, upstreamJson, type UpstreamContext } from './upstream';
@@ -41,6 +42,12 @@ const filterEq = (field: string, value: string) => `${field} = "${value.replace(
 /** The author line for a content item: www sends a name-and-slug object, a plain name, or nothing. */
 const authorName = (author: string | { name: string } | null | undefined) =>
   typeof author === 'string' ? author : author?.name ?? null;
+// get_provider is the one full-profile path and spends the profile quota, so search and similar results
+// are summaries in both blocks: a description cut to a snippet and no services list.
+const SNIPPET = 280;
+const summary = (hit: Record<string, unknown>) => Object.fromEntries(Object.entries(hit)
+  .filter(([key]) => key !== 'services')
+  .map(([key, value]) => [key, key === 'description' && typeof value === 'string' && value.length > SNIPPET ? `${value.slice(0, SNIPPET)}…` : value]));
 const fields = (record: Record<string, unknown>) => Object.entries(record)
   .filter(([, value]) => value !== null && value !== undefined)
   .map(([key, value]) => `- ${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join('\n');
@@ -80,7 +87,7 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
       });
       return result(`${data.estimatedTotalHits} estimated matches.\n\n${data.hits.map(hit =>
         `- [${oneLine(hit.name)}](${listingUrl(hit.slug)}) — ${oneLine(hit.location ?? hit.location_city)}; ${oneLine(hit.primary_category)}; ${hit.is_verified ? 'verified' : hit.is_claimed ? 'claimed' : hit.pricing_tier ?? 'listed'}\n  ${oneLine(hit.description)}\n  Website: ${hit.url ?? 'Not supplied'}`,
-      ).join('\n')}`, data);
+      ).join('\n')}`, { ...data, hits: data.hits.map(summary) });
     }
     case 'get_provider': {
       const data = yield* upstreamJson(context, `/api/directory/listing/${encodeURIComponent(input.slug!)}`, S.Provider);
@@ -90,7 +97,8 @@ const execute = Effect.fn('executeTool')(function* (name: ToolName, input: ToolI
     case 'similar_providers': {
       const query = new URLSearchParams({ slug: input.slug!, limit: String(clamp(input.limit, 6, 12)) });
       const data = yield* upstreamJson(context, `/api/directory/similar?${query}`, S.Similar);
-      return result(data.similar.map(hit => `### [${oneLine(hit.name)}](${listingUrl(hit.slug)})\n${fields(hit)}`).join('\n\n'), data);
+      const similar = data.similar.map(summary);
+      return result(data.similar.map((hit, index) => `### [${oneLine(hit.name)}](${listingUrl(hit.slug)})\n${fields(similar[index]!)}`).join('\n\n'), { ...data, similar });
     }
     case 'list_categories': {
       const data = yield* upstreamJson(context, '/api/search-facets', S.Facets, {
@@ -135,16 +143,21 @@ const notFound: Partial<Record<ToolName, (input: ToolInput) => string>> = {
   similar_providers: input => `No listing with slug "${oneLine(input.slug)}" to compare against. Absence from the directory says nothing about whether the company exists.`,
   get_content: input => `No published ${oneLine(input.type)} with slug "${oneLine(input.slug)}" on Compare the Cloud. It may be unpublished, renamed or never written.`,
 };
+/** Settle a lookup tool's not-found reservation, taken when the request was admitted. */
+const settle = (name: ToolName, missed: boolean, context: UpstreamContext) =>
+  LOOKUP_TOOLS.has(name) && context.onLookup ? context.onLookup(missed) : Effect.void;
 export const runTool = Effect.fn('runTool')(function* (name: ToolName, input: ToolInput, context: UpstreamContext) {
-  return yield* execute(name, input, context).pipe(
+  const { reply, missed } = yield* execute(name, input, context).pipe(
+    Effect.map(reply => ({ reply, missed: false })),
     Effect.catch(error => {
       const missing = error.status === 404 ? notFound[name] : undefined;
-      const reply = result(missing ? missing(input) : error.message, { error: 'upstream_error', status: error.status }, true);
       // A run of misses is how slugs get guessed, so each one counts towards the caller's not-found block.
-      return (missing && context.onNotFound ? context.onNotFound : Effect.void).pipe(Effect.as(reply));
+      return Effect.succeed({ reply: result(missing ? missing(input) : error.message, { error: 'upstream_error', status: error.status }, true), missed: missing !== undefined });
     }),
-    Effect.catchCause(() => Effect.succeed(result(INTERNAL_ERROR, { error: 'internal_error' }, true))),
+    Effect.catchCause(() => Effect.succeed({ reply: result(INTERNAL_ERROR, { error: 'internal_error' }, true), missed: false })),
   );
+  yield* settle(name, missed, context);
+  return reply;
 });
 
 const ToolNameSchema = Schema.Literals(Object.keys(toolTitles) as ToolName[]);
@@ -152,7 +165,10 @@ export const callTool = Effect.fn('callTool')(function* (name: string, args: unk
   return yield* Effect.gen(function* () {
     const tool = yield* Schema.decodeUnknownEffect(ToolNameSchema)(name);
     const parsed = z.object(definitions[tool].inputSchema).safeParse(args);
-    if (!parsed.success) return result('Invalid tool arguments. Check the tool input schema.', { error: 'invalid_arguments' }, true);
+    if (!parsed.success) {
+      yield* settle(tool, false, context);
+      return result('Invalid tool arguments. Check the tool input schema.', { error: 'invalid_arguments' }, true);
+    }
     const response = yield* runTool(tool, parsed.data, context);
     // The tools/call handler bypasses the SDK's output validation, so a declared output schema is enforced here:
     // a result that drifts from what tools/list advertises is an internal error, never a silent mismatch.

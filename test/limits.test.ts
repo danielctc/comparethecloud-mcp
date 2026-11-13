@@ -21,6 +21,7 @@ const upstream = vi.fn(async (input: URL | string) => {
   const path = new URL(String(input)).pathname;
   if (path.endsWith('/missing')) return Response.json({ error: 'not_found' }, { status: 404 });
   if (path.startsWith('/api/directory/listing/')) return Response.json({ listing: { name: 'Example', slug: 'example' } });
+  if (path === '/api/directory/search') return Response.json({ hits: [{ name: 'Example', slug: 'example', description: 'x'.repeat(20_000) }], estimatedTotalHits: 1 });
   return Response.json({ hits: [], estimatedTotalHits: 0 });
 });
 const setup = () => {
@@ -51,7 +52,11 @@ it('refuses the 31st provider profile of the day with 429, Retry-After and the c
   const body = await refused.json() as Record<string, string>;
   expect(body).toMatchObject({ error: 'quota_exceeded', quota: 'provider_profiles', retry_after: 21_600, contact: CONSULTANT_URL });
   expect(body.message).toContain(CONSULTANT_URL);
-  expect((await send(post(message('search_providers', { q: 'cloud' })))).status).toBe(200);
+  // Search still works once the profile cap is spent, but it never carries a full description.
+  const search = await send(post(message('search_providers', { q: 'cloud' })));
+  expect(search.status).toBe(200);
+  const text = await search.text();
+  expect(text).toContain('Example'); expect(text).not.toContain('x'.repeat(281));
 });
 
 it('refuses tool calls past the daily limit with the contact link', async () => {
@@ -154,3 +159,20 @@ it('never serves a tools/call whose body is too large to count', async () => {
   const response = await send(post(padded));
   expect(upstream).not.toHaveBeenCalled(); expect(response.status).toBe(413);
 }, 30_000);
+
+it('refuses a batch of lookups that would cross the not-found limit before any reaches upstream', async () => {
+  const { send } = setup(); upstream.mockClear();
+  const batch = Array.from({ length: 31 }, (_, i) => message('get_content', { type: 'article', slug: 'missing' }, i + 1));
+  const refused = await send(post(batch));
+  expect(refused.status).toBe(429); expect(await refused.json()).toMatchObject({ quota: 'not_found_block' });
+  expect(upstream).not.toHaveBeenCalled();
+});
+
+it('lets at most 30 concurrent not-found lookups reach upstream, then blocks', async () => {
+  const { send } = setup(); upstream.mockClear();
+  const responses = await Promise.all(Array.from({ length: 40 }, () => send(post(message('get_content', { type: 'article', slug: 'missing' })))));
+  expect(upstream.mock.calls.length).toBeLessThanOrEqual(30);
+  expect(responses.filter(response => response.status === 429).length).toBeGreaterThanOrEqual(10);
+  const after = await send(post(message('search_providers', { q: 'cloud' })));
+  expect(after.status).toBe(429); expect(await after.json()).toMatchObject({ quota: 'not_found_block' });
+});

@@ -175,3 +175,28 @@ it('requires the documented search and fetch input shapes', async () => {
     expect(response.structuredContent.error).toBe('invalid_arguments');
   }
 });
+
+// get_provider (and fetch of a provider: id) is the only full-profile path, and it spends the profile quota.
+// Search and similar results are summaries in both blocks, or they would hand out profiles for free.
+const long = 'd'.repeat(20_000);
+it('search_providers returns a short description snippet in both blocks, never the full text', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ hits: [{ name: 'Example', slug: 'example', description: long, categories: ['Cloud'] }], estimatedTotalHits: 1 })));
+  const response = await Effect.runPromise(runTool('search_providers', { q: 'cloud' }, context()));
+  const hit = (response.structuredContent.hits as { description: string; categories: string[] }[])[0]!;
+  expect(hit.description.length).toBeLessThanOrEqual(281); expect(hit.description.endsWith('…')).toBe(true);
+  expect(hit.categories).toEqual(['Cloud']);
+  expect(response.content[0]!.text).not.toContain('d'.repeat(281));
+});
+it('similar_providers returns snippets without services lists in both blocks', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ similar: [{ id: 1, name: 'Example', slug: 'example', description: long, services: ['Backup', 'Hosting'], similarity_score: 0.8 }] })));
+  const response = await Effect.runPromise(runTool('similar_providers', { slug: 'example' }, context()));
+  const hit = (response.structuredContent.similar as Record<string, unknown>[])[0]!;
+  expect((hit.description as string).length).toBeLessThanOrEqual(281); expect(hit).not.toHaveProperty('services');
+  expect(hit).toMatchObject({ id: 1, name: 'Example', slug: 'example', similarity_score: 0.8 });
+  expect(response.content[0]!.text).not.toContain('d'.repeat(281)); expect(response.content[0]!.text).not.toContain('Backup');
+});
+it('leaves a short description untouched', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ hits: [{ name: 'Example', slug: 'example', description: 'Short.' }], estimatedTotalHits: 1 })));
+  const response = await Effect.runPromise(runTool('search_providers', { q: 'cloud' }, context()));
+  expect(response.structuredContent).toEqual({ hits: [{ name: 'Example', slug: 'example', description: 'Short.' }], estimatedTotalHits: 1 });
+});

@@ -6,7 +6,7 @@ import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
 import { readUpTo } from './core/body';
 import { connectorRanges } from './core/connectors';
 import { authorise, type AuthDecision } from './core/keys';
-import { CONTACT_URL, enforceQuota, recordNotFound, REFUSALS, usageOf, type Verdict } from './core/limits';
+import { CONTACT_URL, enforceQuota, REFUSALS, settleLookup, usageOf, type Verdict } from './core/limits';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
@@ -111,8 +111,8 @@ export default {
       const overQuota = await quotaRefusal(request, env, caller, headers);
       if (overQuota) return overQuota;
       const handler = createMcpHandler(() => createServer({ env, bucket: caller.bucket, waitUntil,
-        // Counted after the reply rather than before it: the count never changes what this caller receives.
-        onNotFound: Effect.sync(() => ctx.waitUntil(Effect.runPromise(recordNotFound(env, caller)))) }), {
+        // Settled after the reply rather than before it: the count never changes what this caller receives.
+        onLookup: missed => Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed)))) }), {
         corsOptions: false,
         // This public, cookie-free API accepts every valid HTTP(S) browser origin.
         allowedOriginHostnames: origin ? [origin.hostname] : [],

@@ -6,12 +6,16 @@ import { NOT_FOUND_BLOCK_SECONDS, NOT_FOUND_WINDOW_SECONDS, type Quota, type Quo
 const DAY_MS = 86_400_000;
 const WINDOW_MS = NOT_FOUND_WINDOW_SECONDS * 1_000;
 const BLOCK_MS = NOT_FOUND_BLOCK_SECONDS * 1_000;
+// A reservation outlives any lookup (upstream calls time out at 10 seconds); one never settled, because the
+// handler refused the request or the isolate died, frees itself after this.
+const PENDING_MS = 60_000;
 
 /** One identity's counters. `day` is days since the epoch, so the daily quotas reset at UTC midnight.
- *  `misses` holds the times of not-found lookups in the last hour, at most one hour's limit of them. */
+ *  `misses` holds the times of not-found lookups in the last hour, at most one hour's limit of them, and
+ *  `pending` the times of lookups admitted but not yet settled: each holds a not-found slot until it is. */
 const State = Schema.Struct({
   day: Schema.Number, toolCalls: Schema.Number, providerProfiles: Schema.Number, contentReads: Schema.Number,
-  misses: Schema.Array(Schema.Number), blockedUntil: Schema.Number,
+  misses: Schema.Array(Schema.Number), pending: Schema.Array(Schema.Number), blockedUntil: Schema.Number,
 });
 type State = typeof State.Type;
 interface Decision { state: State; verdict: Verdict }
@@ -24,12 +28,14 @@ const seconds = (ms: number) => Math.max(1, Math.ceil(ms / 1_000));
  *  drop out. State written by an older shape starts fresh rather than failing every call. */
 const current = (storage: Storage, now: number): State => {
   const stored = Option.getOrUndefined(decodeState(storage.kv.get('state')));
-  if (!stored) return { day: dayOf(now), toolCalls: 0, providerProfiles: 0, contentReads: 0, misses: [], blockedUntil: 0 };
+  if (!stored) return { day: dayOf(now), toolCalls: 0, providerProfiles: 0, contentReads: 0, misses: [], pending: [], blockedUntil: 0 };
   const today = stored.day === dayOf(now) ? stored : { ...stored, day: dayOf(now), toolCalls: 0, providerProfiles: 0, contentReads: 0 };
-  return { ...today, misses: today.misses.filter(at => at > now - WINDOW_MS) };
+  return { ...today, misses: today.misses.filter(at => at > now - WINDOW_MS), pending: today.pending.filter(at => at > now - PENDING_MS) };
 };
-/** When nothing in the state matters any more: the end of its day, its block and its newest miss's hour. */
-const expiry = (state: State) => Math.max((state.day + 1) * DAY_MS, state.blockedUntil, ...state.misses.map(at => at + WINDOW_MS));
+/** When nothing in the state matters any more: the end of its day, its block, its newest miss's hour and
+ *  its last reservation. */
+const expiry = (state: State) => Math.max((state.day + 1) * DAY_MS, state.blockedUntil,
+  ...state.misses.map(at => at + WINDOW_MS), ...state.pending.map(at => at + PENDING_MS));
 /** Every identity gets a Durable Object, and one-off addresses are most of them, so each one clears itself. */
 const scheduleCleanup = Effect.fn('scheduleCleanup')(function* (storage: Storage, state: State) {
   const at = expiry(state);
@@ -51,8 +57,15 @@ const consume = Effect.fn('QuotaCounter.consume')(function* (storage: Storage, u
     ];
     const over = checks.find(([, used, adding, limit]) => adding > 0 && used + adding > limit);
     if (over) return { state, verdict: { ok: false, quota: over[0], retryAfter: seconds((state.day + 1) * DAY_MS - now) } };
+    // Each lookup reserves a not-found slot now, before its upstream call, so lookups admitted together (one
+    // batch, or concurrent requests) cannot all pass the check and then all miss.
+    if (usage.lookups > 0 && state.misses.length + state.pending.length + usage.lookups > quota.notFoundPerHour) {
+      const freed = Math.min(...state.misses.map(at => at + WINDOW_MS), ...state.pending.map(at => at + PENDING_MS));
+      return { state, verdict: { ok: false, quota: 'not_found_block', retryAfter: seconds(freed - now) } };
+    }
     const next = { ...state, toolCalls: state.toolCalls + usage.toolCalls,
-      providerProfiles: state.providerProfiles + usage.providerProfiles, contentReads: state.contentReads + usage.contentReads };
+      providerProfiles: state.providerProfiles + usage.providerProfiles, contentReads: state.contentReads + usage.contentReads,
+      pending: [...state.pending, ...Array<number>(usage.lookups).fill(now)] };
     storage.kv.put('state', next);
     return { state: next, verdict: { ok: true } };
   });
@@ -60,14 +73,16 @@ const consume = Effect.fn('QuotaCounter.consume')(function* (storage: Storage, u
   return verdict;
 });
 
-const recordNotFound = Effect.fn('QuotaCounter.recordNotFound')(function* (storage: Storage, quota: Quota) {
+/** Release a lookup's reservation; a miss becomes a counted not-found lookup, and the limit's worth blocks. */
+const settleLookup = Effect.fn('QuotaCounter.settleLookup')(function* (storage: Storage, missed: boolean, quota: Quota) {
   const now = yield* Clock.currentTimeMillis;
   const state = yield* Effect.sync(() => {
     const state = current(storage, now);
-    const misses = [...state.misses, now];
+    const settled = { ...state, pending: state.pending.slice(1) };
+    const misses = missed ? [...state.misses, now] : state.misses;
     const next = misses.length >= quota.notFoundPerHour
-      ? { ...state, misses: [], blockedUntil: now + BLOCK_MS }
-      : { ...state, misses };
+      ? { ...settled, misses: [], blockedUntil: now + BLOCK_MS }
+      : { ...settled, misses };
     storage.kv.put('state', next);
     return next;
   });
@@ -86,8 +101,8 @@ export class QuotaCounter extends DurableObject<Env> {
   consume(usage: Usage, quota: Quota): Promise<Verdict> {
     return Effect.runPromise(consume(this.ctx.storage, usage, quota));
   }
-  recordNotFound(quota: Quota): Promise<void> {
-    return Effect.runPromise(recordNotFound(this.ctx.storage, quota));
+  settleLookup(missed: boolean, quota: Quota): Promise<void> {
+    return Effect.runPromise(settleLookup(this.ctx.storage, missed, quota));
   }
   override alarm(): Promise<void> {
     return Effect.runPromise(cleanup(this.ctx.storage));
