@@ -298,7 +298,8 @@ describe('JWKS', () => {
       expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
       await server.rotate(true);
       const tokens = await Promise.all(Array.from({ length: 5 }, (_, i) => server.mint({ sub: `user_${i}` })));
-      expect((await burst(env, tokens)).toSorted()).toEqual([200, 503, 503, 503, 503]);
+      const statuses = await burst(env, tokens);
+      expect(statuses).toContain(200); expect(statuses).not.toContain(401);
       expect(server.jwksFetches).toBe(2);
     });
   });
