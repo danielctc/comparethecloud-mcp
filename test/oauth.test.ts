@@ -299,23 +299,93 @@ describe('JWKS', () => {
       await server.rotate(true);
       const tokens = await Promise.all(Array.from({ length: 5 }, (_, i) => server.mint({ sub: `user_${i}` })));
       const statuses = await burst(env, tokens);
-      expect(statuses).toContain(200); expect(statuses).not.toContain(401);
+      // 200 for whoever saw the new keys, a retryable 503 for the rest; any other status fails.
+      expect(statuses.filter(status => status !== 200 && status !== 503)).toEqual([]);
+      expect(statuses).toContain(200);
       expect(server.jwksFetches).toBe(2);
+    });
+    it('lets at most 32 requests wait on a cold fetch: the rest get a retryable 503 at once, not a timer each', async () => {
+      const { env } = setup();
+      const tokens = await Promise.all(Array.from({ length: 40 }, (_, i) => server.forge({ sub: `user_${i}` })));
+      const release = server.holdJwks();
+      const early: number[] = [];
+      const pending = tokens.map(token => call(env, '/auth/mcp', { token }).then(response => { early.push(response.status); return response.status; }));
+      await settle();
+      // The overflow is answered while the fetch is still held, so it never waited.
+      expect(early).toEqual(Array(7).fill(503));
+      release();
+      const statuses = await Promise.all(pending);
+      expect(statuses.filter(status => status === 401)).toHaveLength(33);
+      expect(server.jwksFetches).toBe(1);
+    });
+  });
+  describe('after a failed fetch', () => {
+    it('does not refetch for an unknown kid in the same request whose scheduled refresh just failed', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+      const { env } = setup();
+      expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+      server.jwksDown = true; vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
+      expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(503);
+      expect(server.jwksFetches).toBe(2);
+    });
+    it('holds the failure backoff for an unknown kid that follows a failed scheduled refresh', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+      const { env } = setup();
+      expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+      server.jwksDown = true; vi.setSystemTime(new Date('2026-11-13T12:11:00Z'));
+      expect((await call(env, '/auth/mcp', { token: await server.mint({ sub: 'user_2' }) })).status).toBe(200);
+      expect(server.jwksFetches).toBe(2);
+      vi.setSystemTime(new Date('2026-11-13T12:11:30Z'));
+      expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(503);
+      expect(server.jwksFetches).toBe(2);
+      server.jwksDown = false; vi.setSystemTime(new Date('2026-11-13T12:12:01Z'));
+      expect((await call(env, '/auth/mcp', { token: await server.forge({}, 'unknown') })).status).toBe(401);
+      expect(server.jwksFetches).toBe(3);
     });
   });
 });
 
 describe('slow uploads', () => {
   /** A tools/call whose body arrives in two parts, the second only when `finish` is called. */
-  const slowCall = (env: ReturnType<typeof mockEnv>['env'], token: string) => {
+  const slowCall = (env: ReturnType<typeof mockEnv>['env'], token?: string, path = '/auth/mcp') => {
     const bytes = new TextEncoder().encode(search);
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
     const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
     controller?.enqueue(bytes.slice(0, 16));
-    const response = worker.fetch(new Request(`${origin}/auth/mcp`, { method: 'POST', headers: headersFor(token), body, duplex: 'half' } as RequestInit),
+    const response = worker.fetch(new Request(`${origin}${path}`, { method: 'POST', headers: headersFor(token), body, duplex: 'half' } as RequestInit),
       env, createExecutionContext());
     return { response, finish: () => { controller?.enqueue(bytes.slice(16)); controller?.close(); } };
   };
+  /** The response if it arrives within a second of real time, otherwise 'pending': a refusal that waited for the
+   *  body would never arrive, since these uploads are never finished. */
+  const promptly = (response: Promise<Response>) =>
+    Promise.race([response.then(r => r.status), new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), 1_000))]);
+  it.each<[string, (mocked: ReturnType<typeof setup>) => Promise<{ token?: string; path?: string; status: number }>]>([
+    ['a no-token caller over its minute rate', async ({ env }) => {
+      vi.mocked(env.RL_ANON.limit).mockResolvedValue({ success: false }); return { path: '/mcp', status: 429 };
+    }],
+    ['a no-token caller on the deny list', async ({ values }) => {
+      values.set('deny:ip:192.0.2.20', '1'); return { path: '/mcp', status: 403 };
+    }],
+    ['a forged token', async () => ({ token: await server.forge(), status: 401 })],
+    ['a signed-in caller over its minute rate', async ({ env }) => {
+      vi.mocked(env.RL_KEY.limit).mockResolvedValue({ success: false }); return { token: await server.mint(), status: 429 };
+    }],
+  ])('refuses %s before reading any of its upload', async (_name, arrange) => {
+    const mocked = setup();
+    const { token, path, status } = await arrange(mocked);
+    expect(await promptly(slowCall(mocked.env, token, path).response)).toBe(status);
+  });
+  it('answers 408 to an upload that has not finished within 10 seconds', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { env } = setup();
+    const upload = slowCall(env, undefined, '/mcp');
+    for (let i = 0; i < 50; i += 1) await new Promise(resolve => setImmediate(resolve));
+    await vi.advanceTimersByTimeAsync(10_000);
+    const response = await upload.response;
+    expect(response.status).toBe(408); expect(await response.json()).toEqual({ error: 'request_timeout' });
+    expect(response.headers.get('X-CTC-Tier')).toBe('anonymous');
+  });
   it('authorise once the body has arrived, so a grant withdrawn during the upload stops the tool', async () => {
     vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
     const { env } = setup(); const token = await server.mint();
