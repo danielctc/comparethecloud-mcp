@@ -20,6 +20,11 @@ export interface Env {
   QUOTA: DurableObjectNamespace<QuotaCounter>;
   /** OpenAI's published connector egress manifest; unset means no OpenAI ranges, as in the unit tests. */
   OPENAI_CONNECTOR_RANGES_URL?: string;
+  /** OAuth sign-in (/auth/mcp, its metadata, OAuth tokens and dashboard keys). On only when exactly "true". */
+  OAUTH_ENABLED?: string;
+  /** The Worker's own ctc-auth client, used only to introspect tokens (CT-5). */
+  CTC_MCP_CLIENT_ID?: string;
+  CTC_MCP_CLIENT_SECRET?: string;
 }
 
 /** Public site; every upstream URL and every link in tool output derives from it. */

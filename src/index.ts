@@ -7,6 +7,7 @@ import { readUpTo } from './core/body';
 import { connectorRanges } from './core/connectors';
 import { authorise, type AuthDecision } from './core/keys';
 import { callsIn, CONTACT_URL, enforceQuota, refundQuota, REFUSALS, settleLookup, type RpcId, type Usage } from './core/limits';
+import { METADATA_PATH, metadataUrl, oauthEnabled, protectedResourceMetadata, RESOURCE_PATH } from './core/oauth';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
@@ -26,6 +27,16 @@ const html = (body: string, status = 200) => new Response(body, {
 });
 const tierHeaders = (tier: Tier) => ({ ...cors, 'X-CTC-Tier': tier, 'X-RateLimit-Policy': TIERS[tier].policy });
 const anonymousHeaders = tierHeaders('anonymous');
+/** /auth/mcp also exposes its challenge, so a browser-based client can read where to sign in. /mcp keeps the
+ *  shared headers byte for byte. */
+const signInHeaders = (headers: Record<string, string>) =>
+  ({ ...headers, 'Access-Control-Expose-Headers': `${cors['Access-Control-Expose-Headers']}, WWW-Authenticate` });
+/** RFC 6750 and RFC 9728: a 401 from /auth/mcp names its metadata, which names ctc-auth. */
+const challenge = (env: Env, headers: Record<string, string>, error?: 'invalid_token') => {
+  const errorParam = error === undefined ? '' : `, error="${error}"`;
+  return Response.json({ error: error ?? 'unauthorized' }, { status: 401,
+    headers: { ...headers, 'WWW-Authenticate': `Bearer resource_metadata="${metadataUrl(env)}"${errorParam}` } });
+};
 const apiError = (status: number, error: string, headers: Record<string, string>, extra: Record<string, unknown> = {}) =>
   Response.json({ error, ...extra }, { status, headers });
 /** Parse the browser Origin, if any; null means absent, false means malformed. */
@@ -46,6 +57,12 @@ const decorate = (response: Response, headers: Record<string, string>) => {
 };
 /** Discovery documents under /.well-known: the MCP card and the OpenAI plugin-directory domain check. */
 const wellKnown = (path: string, method: string, env: Env): Response | null => {
+  if (path === METADATA_PATH && oauthEnabled(env)) {
+    if (method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    if (method === 'GET' || method === 'HEAD') {
+      return Response.json(protectedResourceMetadata(env), { headers: { ...cors, 'Cache-Control': 'public, max-age=300' } });
+    }
+  }
   if (path === '/.well-known/mcp.json' && method === 'GET') return Response.json({
     name: 'Compare the Cloud', description: 'Read-only UK B2B technology directory, articles, news and opinion.',
     endpoint: `${env.PUBLIC_ORIGIN}/mcp`, transport: 'streamable-http', auth: 'optional bearer key',
@@ -114,7 +131,7 @@ const serve = async (request: Request, env: Env, ctx: ExecutionContext, admitted
       if (reserved === undefined && !owed) return Effect.void;
       return Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed, reserved, owed ? refund : undefined))));
     } }), {
-    corsOptions: false,
+    route: new URL(request.url).pathname, corsOptions: false,
     // This public, cookie-free API accepts every valid HTTP(S) browser origin.
     allowedOriginHostnames: origin ? [origin.hostname] : [],
     allowedHostnames: [new URL(env.PUBLIC_ORIGIN).hostname, 'localhost', '127.0.0.1', '[::1]'],
@@ -131,30 +148,36 @@ const serve = async (request: Request, env: Env, ctx: ExecutionContext, admitted
     return apiError(500, 'internal_error', headers);
   }
 };
+/** An MCP endpoint: /mcp, open to all, or /auth/mcp, the sign-in address, which never answers without a token.
+ *  /auth/mcp adds its challenge to the exposed headers; /mcp keeps the shared ones untouched. */
+const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, signIn: boolean): Promise<Response> => {
+  const routeHeaders = (headers: Record<string, string>) => signIn ? signInHeaders(headers) : headers;
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: routeHeaders(anonymousHeaders) });
+  // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
+  const origin = browserOrigin(request);
+  if (origin === false) return apiError(403, 'invalid_origin', routeHeaders(anonymousHeaders));
+  if (signIn && !request.headers.has('Authorization')) return challenge(env, routeHeaders(anonymousHeaders));
+  const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
+  const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
+    Effect.flatMap(connectors => authorise(request, env, connectors)),
+    Effect.catchCause(() => Effect.succeed(null)),
+  ));
+  // Nothing was verified when authorisation itself failed, so report the anonymous tier.
+  if (!decision) return apiError(503, 'service_unavailable', routeHeaders(anonymousHeaders));
+  const { caller } = decision;
+  const headers = routeHeaders(tierHeaders(caller.tier));
+  if (signIn && decision.status === 401) return challenge(env, headers, 'invalid_token');
+  if (decision.status !== 200) return refusal(decision, headers, env);
+  const metered = await meter(request, env, decision, headers);
+  if (metered instanceof Response) return metered;
+  return serve(request, env, ctx, { origin, caller, headers, ...metered });
+};
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if ((path === '/mcp' || path === '/health') && request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: path === '/mcp' ? anonymousHeaders : cors });
-    }
-    if (path === '/mcp') {
-      // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
-      const origin = browserOrigin(request);
-      if (origin === false) return apiError(403, 'invalid_origin', anonymousHeaders);
-      const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-      const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
-        Effect.flatMap(connectors => authorise(request, env, connectors)),
-        Effect.catchCause(() => Effect.succeed(null)),
-      ));
-      // Nothing was verified when authorisation itself failed, so report the anonymous tier.
-      if (!decision) return apiError(503, 'service_unavailable', anonymousHeaders);
-      const { caller } = decision;
-      const headers = tierHeaders(caller.tier);
-      if (decision.status !== 200) return refusal(decision, headers, env);
-      const metered = await meter(request, env, decision, headers);
-      if (metered instanceof Response) return metered;
-      return serve(request, env, ctx, { origin, caller, headers, ...metered });
-    }
+    // /auth/mcp exists only with OAuth on; otherwise it is the plain 404 it is today.
+    if (path === '/mcp' || (path === RESOURCE_PATH && oauthEnabled(env))) return mcpEndpoint(request, env, ctx, path === RESOURCE_PATH);
+    if (path === '/health' && request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     if (path === '/health' && request.method === 'GET') {
       return Response.json({ ok: true, version, upstream: env.SITE_ORIGIN }, { headers: cors });
     }

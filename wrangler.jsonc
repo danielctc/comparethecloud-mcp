@@ -24,7 +24,10 @@
     "RESEND_FROM": "Compare the Cloud <mcp@comparethecloud.net>",
     "PUBLIC_ORIGIN": "https://mcp.comparethecloud.net",
     // OpenAI's connector egress ranges change, so they are read from the published manifest daily.
-    "OPENAI_CONNECTOR_RANGES_URL": "https://openai.com/chatgpt-connectors.json"
+    "OPENAI_CONNECTOR_RANGES_URL": "https://openai.com/chatgpt-connectors.json",
+    // OAuth sign-in (/auth/mcp and its metadata): off until ctc-auth release/r1, W1 and the ctc-mcp
+    // introspection client are live. Only "true" turns it on. Secrets: CTC_MCP_CLIENT_ID, CTC_MCP_CLIENT_SECRET.
+    "OAUTH_ENABLED": "false"
   },
   "observability": { "enabled": false }
 }
