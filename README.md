@@ -99,7 +99,7 @@ The server reads public endpoints on `www.comparethecloud.net`; it has no databa
 
 Anonymous callers receive 60 requests per minute per IP. [Register for a free key](https://mcp.comparethecloud.net/register) for 600 requests per minute per key, then send `Authorization: Bearer <key>`. An invalid or revoked key returns HTTP 401; a rate-limited request returns HTTP 429 with `Retry-After: 60`. Responses include `X-CTC-Tier` and `X-RateLimit-Policy`.
 
-Registration requires a name, work email, intended use and agreement to the terms and privacy policy; organisation is optional. The key arrives by email and is never displayed by the registration page. Registering again revokes the previous key. Registration allows five submissions per IP per hour. Cloudflare KV is eventually consistent, so registration counters, concurrent re-registration and revocation propagation are best-effort rather than transactional. Cloudflare rate limiting is applied at its edge locations.
+Registration requires a name, work email, intended use and agreement to the terms and privacy policy; organisation is optional. The key arrives by email and is never displayed by the registration page. Registering again issues an additional key and leaves earlier keys active; to revoke a leaked key, ask through the contact page. Registration allows five submissions per IP per hour. Cloudflare KV is eventually consistent, so registration counters and revocation propagation are best-effort rather than transactional. Cloudflare rate limiting is applied at its edge locations.
 
 ## Privacy
 
