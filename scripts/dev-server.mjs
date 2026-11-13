@@ -18,7 +18,8 @@ export function wrangler(args) {
   if (result.status !== 0) throw new Error(`Wrangler failed:\n${result.stdout}\n${result.stderr}`);
   return result.stdout;
 }
-export async function withDevServer(run, seed = () => {}) {
+/** `extraConfigs` runs further Workers beside this one (multi-worker dev), such as a stand-in for a service binding. */
+export async function withDevServer(run, seed = () => {}, extraConfigs = []) {
   await mkdir('.cache', { recursive: true });
   const persistence = await mkdtemp(resolve('.cache/gate-'));
   let child;
@@ -27,7 +28,7 @@ export async function withDevServer(run, seed = () => {}) {
     await seed(persistence);
     const socket = createServer(); socket.listen(0, '127.0.0.1'); await once(socket, 'listening');
     const port = socket.address().port; await new Promise(resolve => socket.close(resolve));
-    child = spawn(process.execPath, [cli, 'dev', '--local', '--ip', '127.0.0.1', '--port', String(port), '--persist-to', persistence, '--show-interactive-dev-session=false', '--var', 'UPSTREAM_SECRET:local-gate-placeholder', '--var', 'RESEND_API_KEY:local-gate-placeholder'], {
+    child = spawn(process.execPath, [cli, 'dev', ...(extraConfigs.length ? ['-c', 'wrangler.jsonc', ...extraConfigs.flatMap(config => ['-c', config])] : []), '--local', '--ip', '127.0.0.1', '--port', String(port), '--persist-to', persistence, '--show-interactive-dev-session=false', '--var', 'UPSTREAM_SECRET:local-gate-placeholder', '--var', 'RESEND_API_KEY:local-gate-placeholder'], {
       env: { ...localEnvironment, WRANGLER_REGISTRY_PATH: resolve(persistence, 'registry') }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });

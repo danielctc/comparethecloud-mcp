@@ -39,7 +39,7 @@ Scope: public read-only remote MCP server for Compare the Cloud with key registr
   EXPECT: /Tests\s+\d+ passed/
   EVIDENCE: pending
 
-- [ ] A8: in workerd, the provider-profile quota trips across one IPv6 /64 with a 429 and the consultant link, the next /64 is unaffected, tools/list is exempt, and a KV deny-list address gets 403
+- [ ] A8: in workerd, the provider-profile quota trips across one IPv6 /64 with a 429 and the consultant link, the next /64 is unaffected, 30 not-found lookups block an address for an hour, tools/list is exempt, and a KV deny-list address gets 403 (a stand-in www Worker answers the service binding)
   CHECK: node scripts/check-limits.mjs
   EXPECT: LIMITS CHECK PASSED
   EVIDENCE: pending
