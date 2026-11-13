@@ -1,11 +1,17 @@
+import { DEFAULT_MAX_REQUEST_BODY_SIZE } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
 import { Effect } from 'effect';
 import { version } from '../package.json';
-import { SITE_URL, TIERS, type Env, type Tier } from './env';
-import { authorise } from './core/keys';
+import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
+import { readUpTo } from './core/body';
+import { connectorRanges } from './core/connectors';
+import { authorise, type AuthDecision } from './core/keys';
+import { CONTACT_URL, enforceQuota, recordNotFound, REFUSALS, usageOf, type Verdict } from './core/limits';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
+
+export { QuotaCounter } from './core/quota';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -54,6 +60,34 @@ const wellKnown = (path: string, method: string, env: Env): Response | null => {
   }
   return null;
 };
+/** The answer for a caller authorise turned away: on the deny list, an unknown key, or over the minute rate. */
+const refusal = (decision: AuthDecision, headers: Record<string, string>, env: Env) => {
+  const register = `${env.PUBLIC_ORIGIN}/register`;
+  if (decision.status === 403) return apiError(403, 'denied', headers, { contact: CONTACT_URL });
+  if (decision.status !== 429) return apiError(decision.status, decision.error ?? 'error', headers, { register });
+  const retryAfter = TIERS[decision.caller.tier].window;
+  return apiError(429, decision.error ?? 'rate_limited', { ...headers, 'Retry-After': String(retryAfter) },
+    { retry_after: retryAfter, register, contact: CONTACT_URL });
+};
+/** Spend this request's tool calls on the caller's daily quota; a Response when it must not go through.
+ *  Only tools/call spends, so initialise and tools/list never touch the counter. The body is read from a
+ *  clone, so the MCP handler still receives the original bytes. */
+const quotaRefusal = async (request: Request, env: Env, caller: Caller, headers: Record<string, string>) => {
+  const verdict: Verdict | 'too_large' | null = await Effect.runPromise(Effect.gen(function* () {
+    // A body too large to read cannot be counted, so it is refused rather than served uncounted. The cap is the
+    // MCP SDK's own transport limit, which it also enforces; this keeps the guarantee if that default changes.
+    const body = request.method === 'POST' ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '';
+    return yield* enforceQuota(env, caller, usageOf(body));
+  }).pipe(
+    Effect.catchTag('BodyTooLarge', () => Effect.succeed('too_large' as const)),
+    Effect.catchCause(() => Effect.succeed(null)),
+  ));
+  if (verdict === 'too_large') return apiError(413, 'payload_too_large', headers);
+  if (!verdict) return apiError(503, 'service_unavailable', headers);
+  if (verdict.ok) return null;
+  return apiError(429, 'quota_exceeded', { ...headers, 'Retry-After': String(verdict.retryAfter) },
+    { quota: verdict.quota, retry_after: verdict.retryAfter, ...REFUSALS[verdict.quota] });
+};
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -64,18 +98,21 @@ export default {
       // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
       const origin = browserOrigin(request);
       if (origin === false) return apiError(403, 'invalid_origin', anonymousHeaders);
-      const decision = await Effect.runPromise(authorise(request, env).pipe(
+      const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
+      const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
+        Effect.flatMap(connectors => authorise(request, env, connectors)),
         Effect.catchCause(() => Effect.succeed(null)),
       ));
       // Nothing was verified when authorisation itself failed, so report the anonymous tier.
       if (!decision) return apiError(503, 'service_unavailable', anonymousHeaders);
-      const headers = tierHeaders(decision.caller.tier);
-      if (decision.status !== 200) {
-        const retryAfter = decision.status === 429 ? TIERS[decision.caller.tier].window : undefined;
-        return apiError(decision.status, decision.error ?? 'error', { ...headers, ...(retryAfter ? { 'Retry-After': String(retryAfter) } : {}) },
-          { ...(retryAfter ? { retry_after: retryAfter } : {}), register: `${env.PUBLIC_ORIGIN}/register` });
-      }
-      const handler = createMcpHandler(() => createServer({ env, bucket: decision.caller.bucket, waitUntil: p => ctx.waitUntil(p) }), {
+      const { caller } = decision;
+      const headers = tierHeaders(caller.tier);
+      if (decision.status !== 200) return refusal(decision, headers, env);
+      const overQuota = await quotaRefusal(request, env, caller, headers);
+      if (overQuota) return overQuota;
+      const handler = createMcpHandler(() => createServer({ env, bucket: caller.bucket, waitUntil,
+        // Counted after the reply rather than before it: the count never changes what this caller receives.
+        onNotFound: Effect.sync(() => ctx.waitUntil(Effect.runPromise(recordNotFound(env, caller)))) }), {
         corsOptions: false,
         // This public, cookie-free API accepts every valid HTTP(S) browser origin.
         allowedOriginHostnames: origin ? [origin.hostname] : [],

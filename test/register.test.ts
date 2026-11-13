@@ -83,6 +83,13 @@ describe('registration', () => {
     expect((await worker.fetch(registrationRequest(), env, createExecutionContext())).status).toBe(429);
     expect(fetch).toHaveBeenCalledTimes(5);
   });
+  it('counts registrations per IPv6 /64, so rotating addresses inside one network buys nothing', async () => {
+    const { env } = mockEnv(); vi.stubGlobal('fetch', vi.fn(async () => Response.json({ id: 'email-id' })));
+    const from = (ip: string) => { const request = registrationRequest(); request.headers.set('CF-Connecting-IP', ip); return request; };
+    for (let i = 1; i <= 5; i++) expect((await worker.fetch(from(`2001:db8:5:5::${i}`), env, createExecutionContext())).status).toBe(200);
+    expect((await worker.fetch(from('2001:db8:5:5::99'), env, createExecutionContext())).status).toBe(429);
+    expect((await worker.fetch(from('2001:db8:5:6::1'), env, createExecutionContext())).status).toBe(200);
+  });
   it('accepts a fresh registration after the fixed window expires', async () => {
     const { env, values } = mockEnv();
     values.set('reg:192.0.2.1', JSON.stringify({ count: 5, expiresAt: 0 }));

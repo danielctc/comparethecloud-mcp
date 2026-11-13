@@ -97,7 +97,18 @@ The server reads public endpoints on `www.comparethecloud.net`; it has no databa
 
 ## Rate limits and keys
 
-Anonymous callers receive 60 requests per minute per IP. [Register for a free key](https://mcp.comparethecloud.net/register) for 600 requests per minute per key, then send `Authorization: Bearer <key>`. An invalid or revoked key returns HTTP 401; a rate-limited request returns HTTP 429 with `Retry-After: 60`. Responses include `X-CTC-Tier` and `X-RateLimit-Policy`.
+Anonymous callers receive 60 requests per minute per IPv4 address or IPv6 /64. [Register for a free key](https://mcp.comparethecloud.net/register) for 600 requests per minute per key, then send `Authorization: Bearer <key>`. An invalid or revoked key returns HTTP 401; a rate-limited request returns HTTP 429 with `Retry-After: 60`. Responses include `X-CTC-Tier` and `X-RateLimit-Policy`.
+
+Tool calls also have daily limits, reset at midnight UTC:
+
+| Limit | Anonymous | With a key |
+|---|---|---|
+| Tool calls per day | 2,000 | 10,000 |
+| Provider profiles per day (`get_provider`, `fetch` of a `provider:` id) | 30 | 150 |
+| Full content reads per day (`get_content`, `fetch` of an article, news or opinion id) | 300 | 2,000 |
+| Lookups of unpublished listings or content per hour | 30, then tool calls pause for an hour | the same |
+
+A request over a daily limit returns HTTP 429 with `Retry-After` set to the seconds until it resets, and a link for heavier use. Hosted connectors that call from their vendor's published addresses get 600 requests per minute and 20,000 tool calls a day per address, because many people share each address.
 
 Registration requires a name, work email, intended use and agreement to the terms and privacy policy; organisation is optional. The key arrives by email and is never displayed by the registration page. Registering again revokes the previous key. Registration allows five submissions per IP per hour. Cloudflare KV is eventually consistent, so registration counters, concurrent re-registration and revocation propagation are best-effort rather than transactional. Cloudflare rate limiting is applied at its edge locations.
 
@@ -105,7 +116,7 @@ Registration requires a name, work email, intended use and agreement to the term
 
 The server stores the registration details you submit — name, email, organisation, stated use — in Cloudflare KV to issue and revoke keys. Tool calls are not logged with their content. See https://www.comparethecloud.net/privacy-policy.
 
-Only a SHA-256 hash of each key is stored in KV. The plain key is sent to the email delivery service, Resend, for delivery; it is not stored or logged by this Worker. Anonymous IP addresses are used in rate-limit buckets and temporary registration counters. The website receives the query and a caller bucket (IP or key hash) to apply its own rate limits. Worker observability is disabled in this repository's configuration.
+Only a SHA-256 hash of each key is stored in KV. The plain key is sent to the email delivery service, Resend, for delivery; it is not stored or logged by this Worker. Anonymous IP addresses are used in rate-limit buckets, daily quota counters (cleared once their day and any block have passed) and temporary registration counters. The website receives the query and a caller bucket (IP or key hash) to apply its own rate limits. Worker observability is disabled in this repository's configuration.
 
 ## Support
 

@@ -38,3 +38,8 @@ Scope: public read-only remote MCP server for Compare the Cloud with key registr
   CHECK: npx vitest run test/tools.test.ts
   EXPECT: /Tests\s+\d+ passed/
   EVIDENCE: pending
+
+- [ ] A8: in workerd, the provider-profile quota trips across one IPv6 /64 with a 429 and the consultant link, the next /64 is unaffected, tools/list is exempt, and a KV deny-list address gets 403
+  CHECK: node scripts/check-limits.mjs
+  EXPECT: LIMITS CHECK PASSED
+  EVIDENCE: pending

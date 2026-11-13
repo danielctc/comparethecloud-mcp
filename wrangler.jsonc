@@ -15,11 +15,16 @@
       { "name": "RL_KEY", "type": "ratelimit", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } }
     ]
   },
+  // Daily quotas and the not-found block need a counter that outlives the 60-second ratelimit window.
+  "durable_objects": { "bindings": [{ "name": "QUOTA", "class_name": "QuotaCounter" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QuotaCounter"] }],
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "vars": {
     "SITE_ORIGIN": "https://www.comparethecloud.net",
     "RESEND_FROM": "Compare the Cloud <mcp@comparethecloud.net>",
-    "PUBLIC_ORIGIN": "https://mcp.comparethecloud.net"
+    "PUBLIC_ORIGIN": "https://mcp.comparethecloud.net",
+    // OpenAI's connector egress ranges change, so they are read from the published manifest daily.
+    "OPENAI_CONNECTOR_RANGES_URL": "https://openai.com/chatgpt-connectors.json"
   },
   "observability": { "enabled": false }
 }

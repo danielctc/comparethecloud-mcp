@@ -1,6 +1,8 @@
 import { DateTime, Effect, Schema } from 'effect';
 import { SITE_URL, TIERS, type Env } from '../env';
 import { escapeHtml } from '../html';
+import { readUpTo } from './body';
+import { anonymousBucket } from './ip';
 import { generateKey, hashKey, readJson, storage, writeKey, type KeyRecord } from './keys';
 
 const length = (min: number, max: number) => Schema.String.check(Schema.isMinLength(min), Schema.isMaxLength(max));
@@ -16,27 +18,10 @@ export class RegistrationError extends Schema.TaggedError<RegistrationError>()('
 const SEND_FAILED = 'Could not send, try again later.';
 const MAX_FORM_BYTES = 16_384;
 const tooLarge = () => new RegistrationError({ status: 413, message: 'The registration form is too large.' });
-/** Read the body up to a byte cap, so a chunked request without Content-Length is bounded as well. */
-const readBounded = (request: Request, max: number) => Effect.tryPromise({
-  try: async () => {
-    const reader = request.body?.getReader();
-    if (!reader) return '';
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > max) { await reader.cancel(); throw tooLarge(); }
-      chunks.push(value);
-    }
-    const bytes = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return new TextDecoder().decode(bytes);
-  },
-  catch: error => error instanceof RegistrationError ? error : new RegistrationError({ status: 400, message: 'Could not read the registration form.' }),
-});
+/** Read the form up to a byte cap, so a chunked request without Content-Length is bounded as well. */
+const readBounded = (request: Request, max: number) => readUpTo(request.body, max).pipe(
+  Effect.mapError(error => error._tag === 'BodyTooLarge' ? tooLarge() : new RegistrationError({ status: 400, message: 'Could not read the registration form.' })),
+);
 const sendFailed = () => new RegistrationError({ status: 500, message: SEND_FAILED });
 
 const sendKey = Effect.fn('sendKey')(function* (env: Env, email: string, key: string) {
@@ -76,7 +61,8 @@ export const register = Effect.fn('register')(function* (request: Request, env: 
   }).pipe(Effect.mapError(() => new RegistrationError({
     status: 400, message: 'Enter a name (2–80 characters), a valid work email and your intended use (10–500 characters), and agree to the terms and privacy policy.',
   })));
-  const counterKey = `reg:${request.headers.get('CF-Connecting-IP') ?? 'unknown'}`;
+  // Per IPv4 address or IPv6 /64, like the MCP buckets: `reg:192.0.2.1` keeps its old shape.
+  const counterKey = `reg:${anonymousBucket(request.headers.get('CF-Connecting-IP')).slice('ip:'.length)}`;
   const clock = yield* DateTime.now;
   const now = DateTime.toEpochMillis(clock);
   const stored = yield* readJson(env, counterKey, Counter);

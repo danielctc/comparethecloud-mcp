@@ -137,10 +137,12 @@ const notFound: Partial<Record<ToolName, (input: ToolInput) => string>> = {
 };
 export const runTool = Effect.fn('runTool')(function* (name: ToolName, input: ToolInput, context: UpstreamContext) {
   return yield* execute(name, input, context).pipe(
-    Effect.catch(error => Effect.succeed(result(
-      error.status === 404 && notFound[name] ? notFound[name](input) : error.message,
-      { error: 'upstream_error', status: error.status }, true,
-    ))),
+    Effect.catch(error => {
+      const missing = error.status === 404 ? notFound[name] : undefined;
+      const reply = result(missing ? missing(input) : error.message, { error: 'upstream_error', status: error.status }, true);
+      // A run of misses is how slugs get guessed, so each one counts towards the caller's not-found block.
+      return (missing && context.onNotFound ? context.onNotFound : Effect.void).pipe(Effect.as(reply));
+    }),
     Effect.catchCause(() => Effect.succeed(result(INTERNAL_ERROR, { error: 'internal_error' }, true))),
   );
 });
