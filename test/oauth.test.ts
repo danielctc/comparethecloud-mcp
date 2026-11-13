@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { resetOAuthCaches } from '../src/core/oauth';
-import { CLIENT, dashboardKey, ISSUER, RESOURCE, routeFetch, testAuthServer, USERINFO, type TestAuthServer } from './auth-server';
+import { CLIENT, dashboardKey, ISSUER, RESOURCE, routeFetch, testAuthServer, USERINFO, type Introspected, type TestAuthServer } from './auth-server';
 import { createExecutionContext, mockEnv } from './helpers';
 
 const origin = 'https://mcp.comparethecloud.net';
@@ -34,6 +34,7 @@ const call = (env: ReturnType<typeof mockEnv>['env'], path: string, init: { toke
 };
 const rlKeys = (env: ReturnType<typeof mockEnv>['env']) => vi.mocked(env.RL_KEY.limit).mock.calls.map(([options]) => options.key);
 const authCalls = () => server.handle.mock.calls.length;
+const sha256Hex = async (text: string) => Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))).toString('hex');
 
 beforeEach(async () => {
   resetOAuthCaches();
@@ -79,6 +80,22 @@ describe('/auth/mcp', () => {
     expect(response.headers.get('WWW-Authenticate')).toBe(CHALLENGE);
     expect(response.headers.get('Access-Control-Expose-Headers')).toContain('WWW-Authenticate');
     expect(env.RL_ANON.limit).not.toHaveBeenCalled(); expect(env.RL_KEY.limit).not.toHaveBeenCalled();
+    expect(authCalls()).toBe(0);
+  });
+  it.each([['a Basic header', 'Basic Zm9vOmJhcg=='], ['an empty header', '']])(
+    'treats %s as no bearer token: the plain challenge, with no error code (RFC 6750 3.1)', async (_name, authorization) => {
+      const { env } = setup();
+      const response = await worker.fetch(new Request(`${origin}/auth/mcp`, { method: 'POST', body: initialise,
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Host: 'mcp.comparethecloud.net', Authorization: authorization } }),
+      env, createExecutionContext());
+      expect(response.status).toBe(401); expect(response.headers.get('WWW-Authenticate')).toBe(CHALLENGE);
+    });
+  it('serves a legacy emailed key on /auth/mcp too, on its unchanged k: bucket', async () => {
+    const { env, values } = setup(); const key = `ctc_${'b'.repeat(40)}`;
+    values.set(`key:${await sha256Hex(key)}`, JSON.stringify({ name: 'Legacy', email: 'legacy@example.test', org: '', use: 'test',
+      createdAt: '2026-11-06T12:00:00.000Z', tier: 'registered', status: 'active' }));
+    const response = await call(env, '/auth/mcp', { token: key });
+    expect(response.status).toBe(200); expect(rlKeys(env)).toEqual([`k:${await sha256Hex('legacy@example.test')}`]);
     expect(authCalls()).toBe(0);
   });
   it('answers a preflight with the challenge header exposed', async () => {
@@ -187,6 +204,14 @@ describe('JWKS', () => {
     for (let i = 1; i < 5; i += 1) expect((await call(env, '/auth/mcp', { token: await server.forge({}, `unknown-${i}`) })).status).toBe(503);
     expect(server.jwksFetches).toBe(2);
   });
+  it('answers 503, not 401, for a token from a just-rotated key while the JWKS cannot be fetched', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
+    const { env } = setup();
+    expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(200);
+    await server.rotate(); server.jwksDown = true;
+    vi.setSystemTime(new Date('2026-11-13T12:02:00Z'));
+    expect((await call(env, '/auth/mcp', { token: await server.mint() })).status).toBe(503);
+  });
   it('picks up a rotation within a minute even while forged kids keep arriving', async () => {
     vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-13T12:00:00Z'));
     const { env } = setup();
@@ -285,7 +310,7 @@ describe('introspection', () => {
     expect((await call(env, '/auth/mcp', { token })).status).toBe(200);
     expect(server.introspections).toHaveLength(2);
   });
-  it.each<[string, Record<string, unknown>]>([
+  it.each<[string, Partial<Introspected>]>([
     ['inactive', { active: false }],
     ['active but for another resource', { aud: ['https://other.example'] }],
     ['active with no audience', { aud: undefined }],
@@ -392,13 +417,19 @@ describe('dashboard API keys', () => {
 
 describe('scope', () => {
   const SCOPE_CHALLENGE = `Bearer error="insufficient_scope", scope="mcp:read", resource_metadata="${METADATA}"`;
-  it('refuses a JWT without mcp:read with 403 insufficient_scope', async () => {
+  it('refuses a JWT without mcp:read with 403 insufficient_scope, after introspecting it', async () => {
     const { env } = setup();
     const response = await call(env, '/auth/mcp', { token: await server.mint({ scope: 'openid email' }) });
     expect(response.status).toBe(403);
     expect(response.headers.get('WWW-Authenticate')).toBe(SCOPE_CHALLENGE);
     expect(await response.json()).toEqual({ error: 'insufficient_scope', scope: 'mcp:read' });
+    expect(server.introspections).toHaveLength(1);
     expect(env.RL_KEY.limit).not.toHaveBeenCalled();
+  });
+  it('tells a revoked token without mcp:read to sign in again (401), not to ask for more scope', async () => {
+    const { env } = setup(); const token = await server.mint({ scope: 'openid email' }); server.revoked.add(token);
+    const response = await call(env, '/auth/mcp', { token });
+    expect(response.status).toBe(401); expect(response.headers.get('WWW-Authenticate')).toBe(INVALID);
   });
   it.each([['no scope at all', undefined], ['a lookalike scope', 'mcp:readwrite openid'], ['mcp:read as a substring', 'xmcp:read']])(
     'refuses a JWT with %s', async (_name, scope) => {
