@@ -146,9 +146,11 @@ const loadJwks = Effect.fnUntraced(function* (force: boolean) {
     Effect.option,
   );
   // A failed refresh keeps the last good keys: they are still the issuer's, and every token is introspected
-  // anyway. With none ever fetched there is nothing to verify against, so the request fails closed.
+  // anyway. With none ever fetched there is nothing to verify against, so the request fails closed, and so does a
+  // forced refetch for an unknown kid: the old keys cannot settle whether the token is good.
   if (Option.isSome(fetched)) jwks = fetched.value;
   refreshAt = now + (Option.isSome(fetched) ? JWKS_FRESH_MS : jwks ? JWKS_FORCED_COOLDOWN_MS : JWKS_RETRY_MS);
+  if (force && Option.isNone(fetched)) return yield* new AuthUnavailable({});
   return jwks ?? (yield* new AuthUnavailable({}));
 });
 
@@ -226,13 +228,15 @@ const judgeClaims = (env: Env, claims: Claims): Verdict => {
   return grantsRead(claims.scope) ? user(subject.value) : insufficientScope;
 };
 
-/** A JWT: verified locally, then always introspected. The answer, not the token, decides. */
+/** A JWT: verified locally, then always introspected, before scope is judged, so a revoked token is told to sign
+ *  in again (401) rather than to ask for more scope (403). The answer, not the token, decides. */
 const verifyJwt = Effect.fnUntraced(function* (env: Env, token: string, meters: Meters): Effect.fn.Return<Verdict, AuthUnavailable | IntrospectionThrottled> {
   const verified = yield* verifyLocally(env, token);
   if (Option.isNone(verified)) return invalid;
   const local = judgeClaims(env, verified.value);
-  if (local.kind !== 'user') return local;
-  const answer = yield* introspect(env, token, { cache: jwtAnswers, admit: meters.user(local.sub), accessToken: true });
+  const subject = userSubject(verified.value);
+  if (local.kind === 'invalid' || Option.isNone(subject)) return invalid;
+  const answer = yield* introspect(env, token, { cache: jwtAnswers, admit: meters.user(subject.value), accessToken: true });
   if (!answer.active) return invalid;
   // The bucket stays the verified token's own subject; the answer must still vouch for the resource and scope.
   if (!forThisResource(env, answer.aud) || answer.cnf !== undefined) return invalid;

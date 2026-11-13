@@ -162,7 +162,8 @@ const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, si
   // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
   const origin = browserOrigin(request);
   if (origin === false) return apiError(403, 'invalid_origin', routeHeaders(anonymousHeaders));
-  if (signIn && !request.headers.has('Authorization')) return challenge(env, routeHeaders(anonymousHeaders));
+  // RFC 6750 3.1: a request with no bearer token, including a Basic or empty header, gets the plain challenge.
+  if (signIn && !/^Bearer /i.test(request.headers.get('Authorization') ?? '')) return challenge(env, routeHeaders(anonymousHeaders));
   const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
   const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
     Effect.flatMap(connectors => authorise(request, env, connectors)),
