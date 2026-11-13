@@ -1,12 +1,14 @@
 import { DEFAULT_MAX_REQUEST_BODY_SIZE, isJsonContentType } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
-import { Effect } from 'effect';
+import { Effect, type Exit } from 'effect';
 import { version } from '../package.json';
 import { SITE_URL, TIERS, type Caller, type Env, type Tier } from './env';
-import { readUpTo } from './core/body';
+import { readUpTo, type BodyTooLarge, type BodyUnreadable } from './core/body';
 import { connectorRanges } from './core/connectors';
-import { authorise, type AuthDecision } from './core/keys';
+import type { Cidr } from './core/ip';
+import { authorise, recheck, type AuthDecision } from './core/keys';
 import { callsIn, CONTACT_URL, enforceQuota, refundQuota, REFUSALS, settleLookup, type RpcId, type Usage } from './core/limits';
+import { METADATA_PATH, metadataUrl, oauthEnabled, protectedResourceMetadata, REQUIRED_SCOPE, RESOURCE_PATH } from './core/oauth';
 import { registerSafely } from './core/registration';
 import { landing, registrationFailure, registrationForm, registrationSuccess } from './html';
 import { createServer } from './mcp';
@@ -26,6 +28,22 @@ const html = (body: string, status = 200) => new Response(body, {
 });
 const tierHeaders = (tier: Tier) => ({ ...cors, 'X-CTC-Tier': tier, 'X-RateLimit-Policy': TIERS[tier].policy });
 const anonymousHeaders = tierHeaders('anonymous');
+/** /auth/mcp also exposes its challenge, so a browser-based client can read where to sign in. /mcp keeps the
+ *  shared headers byte for byte. */
+const signInHeaders = (headers: Record<string, string>) =>
+  ({ ...headers, 'Access-Control-Expose-Headers': `${cors['Access-Control-Expose-Headers']}, WWW-Authenticate` });
+/** RFC 6750 and RFC 9728: a 401 from /auth/mcp names its metadata, which names ctc-auth. */
+const challenge = (env: Env, headers: Record<string, string>, error?: 'invalid_token') => {
+  const errorParam = error === undefined ? '' : `, error="${error}"`;
+  return Response.json({ error: error ?? 'unauthorized' }, { status: 401,
+    headers: { ...headers, 'WWW-Authenticate': `Bearer resource_metadata="${metadataUrl(env)}"${errorParam}` } });
+};
+/** RFC 6750 section 3.1: a valid token without the scope these tools need. Only /auth/mcp adds the challenge. */
+const scopeRefusal = (env: Env, headers: Record<string, string>, signIn: boolean) => {
+  const challengeHeader = `Bearer error="insufficient_scope", scope="${REQUIRED_SCOPE}", resource_metadata="${metadataUrl(env)}"`;
+  return Response.json({ error: 'insufficient_scope', scope: REQUIRED_SCOPE },
+    { status: 403, headers: signIn ? { ...headers, 'WWW-Authenticate': challengeHeader } : headers });
+};
 const apiError = (status: number, error: string, headers: Record<string, string>, extra: Record<string, unknown> = {}) =>
   Response.json({ error, ...extra }, { status, headers });
 /** Parse the browser Origin, if any; null means absent, false means malformed. */
@@ -46,6 +64,12 @@ const decorate = (response: Response, headers: Record<string, string>) => {
 };
 /** Discovery documents under /.well-known: the MCP card and the OpenAI plugin-directory domain check. */
 const wellKnown = (path: string, method: string, env: Env): Response | null => {
+  if (path === METADATA_PATH && oauthEnabled(env)) {
+    if (method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    if (method === 'GET' || method === 'HEAD') {
+      return Response.json(protectedResourceMetadata(env), { headers: { ...cors, 'Cache-Control': 'public, max-age=300' } });
+    }
+  }
   if (path === '/.well-known/mcp.json' && method === 'GET') return Response.json({
     name: 'Compare the Cloud', description: 'Read-only UK B2B technology directory, articles, news and opinion.',
     endpoint: `${env.PUBLIC_ORIGIN}/mcp`, transport: 'streamable-http', auth: 'optional bearer key',
@@ -69,17 +93,27 @@ const refusal = (decision: AuthDecision, headers: Record<string, string>, env: E
   return apiError(429, decision.error ?? 'rate_limited', { ...headers, 'Retry-After': String(retryAfter) },
     { retry_after: retryAfter, register, contact: CONTACT_URL });
 };
+/** How long an admitted caller has to finish its upload before it gets 408. */
+const UPLOAD_DEADLINE_MS = 10_000;
+const hasJsonBody = (request: Request) => request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
+/** A JSON POST's body, read to the end from a clone once the caller is admitted, within the upload deadline. The
+ *  handler still gets the original. The cap is the MCP SDK's own transport limit, which it also enforces; this
+ *  keeps the guarantee if that default changes. Too large or unreadable is judged in meter. */
+type Body = Exit.Exit<string, BodyTooLarge | BodyUnreadable>;
+const readBody = (request: Request): Promise<Body | 'timed_out'> => Effect.runPromise(Effect.suspend(() =>
+  hasJsonBody(request) ? readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : Effect.succeed('')).pipe(
+  Effect.exit,
+  Effect.timeoutOrElse({ duration: UPLOAD_DEADLINE_MS, orElse: () => Effect.succeed('timed_out' as const) }),
+));
 /** Spend this request's tool calls on the caller's daily quota. Gives a Response when the request must not go
  *  through, otherwise the time its lookups' not-found slots were reserved at, if any. Only tools/call
  *  requests spend, so initialise and tools/list never touch the counter, and neither does a body the
- *  transport will refuse as not JSON. The body is read from a clone: the handler still gets the original. */
-const meter = async (request: Request, env: Env, decision: AuthDecision, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
+ *  transport will refuse as not JSON. */
+const meter = async (body: Body, env: Env, decision: AuthDecision, headers: Record<string, string>): Promise<Response | { usage: Usage; reservedAt?: number }> => {
   const { caller } = decision;
   const outcome = await Effect.runPromise(Effect.gen(function* () {
-    // A body too large to read cannot be counted, so it is refused rather than served uncounted. The cap is the
-    // MCP SDK's own transport limit, which it also enforces; this keeps the guarantee if that default changes.
-    const json = request.method === 'POST' && isJsonContentType(request.headers.get('Content-Type'));
-    const calls = callsIn(json ? yield* readUpTo(request.clone().body, DEFAULT_MAX_REQUEST_BODY_SIZE) : '');
+    // A body too large to read cannot be counted, so it is refused rather than served uncounted.
+    const calls = callsIn(yield* body);
     // With the deny list unreadable, only a request that runs no tool goes on: any tool call, batched or not, is
     // a 503, as it would be for any other storage failure.
     if (decision.denyListUnchecked && calls.usage.toolCalls > 0) return null;
@@ -114,7 +148,7 @@ const serve = async (request: Request, env: Env, ctx: ExecutionContext, admitted
       if (reserved === undefined && !owed) return Effect.void;
       return Effect.sync(() => ctx.waitUntil(Effect.runPromise(settleLookup(env, caller, missed, reserved, owed ? refund : undefined))));
     } }), {
-    corsOptions: false,
+    route: new URL(request.url).pathname, corsOptions: false,
     // This public, cookie-free API accepts every valid HTTP(S) browser origin.
     allowedOriginHostnames: origin ? [origin.hostname] : [],
     allowedHostnames: [new URL(env.PUBLIC_ORIGIN).hostname, 'localhost', '127.0.0.1', '[::1]'],
@@ -131,30 +165,55 @@ const serve = async (request: Request, env: Env, ctx: ExecutionContext, admitted
     return apiError(500, 'internal_error', headers);
   }
 };
+/** An MCP endpoint: /mcp, open to all, or /auth/mcp, the sign-in address, which never answers without a token.
+ *  /auth/mcp adds its challenge to the exposed headers; /mcp keeps the shared ones untouched. */
+const mcpEndpoint = async (request: Request, env: Env, ctx: ExecutionContext, signIn: boolean): Promise<Response> => {
+  const routeHeaders = (headers: Record<string, string>) => signIn ? signInHeaders(headers) : headers;
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: routeHeaders(anonymousHeaders) });
+  // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
+  const origin = browserOrigin(request);
+  if (origin === false) return apiError(403, 'invalid_origin', routeHeaders(anonymousHeaders));
+  // RFC 6750 3.1: a request with no bearer token, including a Basic or empty header, gets the plain challenge.
+  if (signIn && !/^Bearer /i.test(request.headers.get('Authorization') ?? '')) return challenge(env, routeHeaders(anonymousHeaders));
+  const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
+  /** An authorisation step; null when it could not be finished. */
+  const decide = (step: (connectors: readonly Cidr[]) => Effect.Effect<AuthDecision, unknown>) =>
+    Effect.runPromise(connectorRanges(env, waitUntil).pipe(Effect.flatMap(step), Effect.catchCause(() => Effect.succeed(null))));
+  // Nothing was verified when authorisation itself failed, so report the anonymous tier.
+  const unavailable = () => apiError(503, 'service_unavailable', routeHeaders(anonymousHeaders));
+  /** The answer for a caller turned away, or null when it may go on. */
+  const turnedAway = (decision: AuthDecision): Response | null => {
+    const headers = routeHeaders(tierHeaders(decision.caller.tier));
+    if (signIn && decision.status === 401) return challenge(env, headers, 'invalid_token');
+    if (decision.error === 'insufficient_scope') return scopeRefusal(env, headers, signIn);
+    return decision.status === 200 ? null : refusal(decision, headers, env);
+  };
+  // Admission comes from the headers alone (minute rate, deny list, credential), so a caller refused for any of
+  // them never has a byte of its upload read.
+  const admitted = await decide(connectors => authorise(request, env, connectors));
+  if (!admitted) return unavailable();
+  const refused = turnedAway(admitted);
+  if (refused) return refused;
+  const { caller } = admitted;
+  const headers = routeHeaders(tierHeaders(caller.tier));
+  const body = await readBody(request);
+  if (body === 'timed_out') return apiError(408, 'request_timeout', headers);
+  // The credential again once the upload is in, so a grant withdrawn or a key revoked while it arrived stops the
+  // request before any tool runs. A request with no body had nothing to wait for.
+  const decision = hasJsonBody(request) ? await decide(connectors => recheck(request, env, connectors, admitted)) : admitted;
+  if (!decision) return unavailable();
+  const refusedAfterUpload = turnedAway(decision);
+  if (refusedAfterUpload) return refusedAfterUpload;
+  const metered = await meter(body, env, decision, headers);
+  if (metered instanceof Response) return metered;
+  return serve(request, env, ctx, { origin, caller, headers, ...metered });
+};
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if ((path === '/mcp' || path === '/health') && request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: path === '/mcp' ? anonymousHeaders : cors });
-    }
-    if (path === '/mcp') {
-      // Shape checks first: a malformed Origin is refused before any KV read or rate-limit token is spent.
-      const origin = browserOrigin(request);
-      if (origin === false) return apiError(403, 'invalid_origin', anonymousHeaders);
-      const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-      const decision = await Effect.runPromise(connectorRanges(env, waitUntil).pipe(
-        Effect.flatMap(connectors => authorise(request, env, connectors)),
-        Effect.catchCause(() => Effect.succeed(null)),
-      ));
-      // Nothing was verified when authorisation itself failed, so report the anonymous tier.
-      if (!decision) return apiError(503, 'service_unavailable', anonymousHeaders);
-      const { caller } = decision;
-      const headers = tierHeaders(caller.tier);
-      if (decision.status !== 200) return refusal(decision, headers, env);
-      const metered = await meter(request, env, decision, headers);
-      if (metered instanceof Response) return metered;
-      return serve(request, env, ctx, { origin, caller, headers, ...metered });
-    }
+    // /auth/mcp exists only with OAuth on; otherwise it is the plain 404 it is today.
+    if (path === '/mcp' || (path === RESOURCE_PATH && oauthEnabled(env))) return mcpEndpoint(request, env, ctx, path === RESOURCE_PATH);
+    if (path === '/health' && request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     if (path === '/health' && request.method === 'GET') {
       return Response.json({ ok: true, version, upstream: env.SITE_ORIGIN }, { headers: cors });
     }

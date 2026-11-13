@@ -12,7 +12,9 @@
   "unsafe": {
     "bindings": [
       { "name": "RL_ANON", "type": "ratelimit", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
-      { "name": "RL_KEY", "type": "ratelimit", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } }
+      { "name": "RL_KEY", "type": "ratelimit", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
+      // OAuth revocation checks (introspection cache misses) per signed-in user; used only with OAUTH_ENABLED.
+      { "name": "RL_INTROSPECT", "type": "ratelimit", "namespace_id": "1003", "simple": { "limit": 120, "period": 60 } }
     ]
   },
   // Daily quotas and the not-found block need a counter that outlives the 60-second ratelimit window.
@@ -24,7 +26,10 @@
     "RESEND_FROM": "Compare the Cloud <mcp@comparethecloud.net>",
     "PUBLIC_ORIGIN": "https://mcp.comparethecloud.net",
     // OpenAI's connector egress ranges change, so they are read from the published manifest daily.
-    "OPENAI_CONNECTOR_RANGES_URL": "https://openai.com/chatgpt-connectors.json"
+    "OPENAI_CONNECTOR_RANGES_URL": "https://openai.com/chatgpt-connectors.json",
+    // OAuth sign-in (/auth/mcp and its metadata): off until ctc-auth release/r1, W1 and the ctc-mcp
+    // introspection client are live. Only "true" turns it on. Secrets: CTC_MCP_CLIENT_ID, CTC_MCP_CLIENT_SECRET.
+    "OAUTH_ENABLED": "false"
   },
   "observability": { "enabled": false }
 }

@@ -1,2 +1,4 @@
 RESEND_API_KEY=replace-with-your-resend-api-key
 UPSTREAM_SECRET=replace-with-your-upstream-secret
+CTC_MCP_CLIENT_ID=replace-with-the-ctc-mcp-introspection-client-id
+CTC_MCP_CLIENT_SECRET=replace-with-the-ctc-mcp-introspection-client-secret

@@ -10,6 +10,7 @@ export function mockEnv() {
     MCP_KEYS: { get, put } as unknown as KVNamespace,
     RL_ANON: { limit: vi.fn(async () => ({ success: true })) },
     RL_KEY: { limit: vi.fn(async () => ({ success: true })) },
+    RL_INTROSPECT: { limit: vi.fn(async () => ({ success: true })) },
     ASSETS: { fetch: vi.fn(async () => new Response('image')) } as unknown as Fetcher,
     // The service binding resolves the global fetch at call time, so vi.stubGlobal('fetch') still intercepts it.
     SITE: { fetch: (input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init) } as unknown as Fetcher,

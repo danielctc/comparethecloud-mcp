@@ -43,3 +43,8 @@ Scope: public read-only remote MCP server for Compare the Cloud with key registr
   CHECK: node scripts/check-limits.mjs
   EXPECT: LIMITS CHECK PASSED
   EVIDENCE: pending
+
+- [ ] A9: behind OAUTH_ENABLED, /auth/mcp and its RFC 9728 metadata exist only when the flag is "true"; a JWT is verified against a generated JWKS (issuer, audience, typ, expiry, user subject), revocation lands within 60 seconds of cached introspection, opaque tokens and dashboard keys go through introspection, and no-token /mcp answers are unchanged with the flag on
+  CHECK: npx vitest run test/oauth.test.ts test/no-token-snapshot.test.ts
+  EXPECT: /Tests\s+\d+ passed/
+  EVIDENCE: pending

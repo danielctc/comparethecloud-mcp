@@ -1,7 +1,8 @@
 import { Effect, Schema } from 'effect';
 import type { Env, Caller } from '../env';
 import { anonymousBucket, inRanges, type Cidr } from './ip';
-import { QUOTAS } from './limits';
+import { QUOTAS, type LimitProfile } from './limits';
+import { identifyBearer, oauthEnabled, type AuthUnavailable } from './oauth';
 
 export const KeyRecord = Schema.Struct({
   name: Schema.String, email: Schema.String, org: Schema.String, use: Schema.String,
@@ -57,24 +58,46 @@ const denied = (env: Env, buckets: readonly string[]) => Effect.forEach(
   Effect.map(entries => entries.some(entry => entry !== null)),
   Effect.catchTag('StorageError', () => Effect.sync(() => { console.error('deny_list_unavailable'); return 'unknown' as const; })),
 );
-export const authorise = Effect.fn('authorise')(function* (request: Request, env: Env, connectors: readonly Cidr[]): Effect.fn.Return<AuthDecision, StorageError> {
-  const header = request.headers.get('Authorization');
+/** A credential's quota bucket, or why it gets none. The quota belongs to the person, not the key. */
+type Credential = { bucket: string } | { status: 401 | 403 | 429; error: 'invalid_key' | 'insufficient_scope' | 'rate_limited' };
+const invalid: Credential = { status: 401, error: 'invalid_key' };
+const credentialBucket = Effect.fnUntraced(function* (env: Env, header: string, address: string, addressLimits: LimitProfile): Effect.fn.Return<Credential, StorageError | AuthUnavailable> {
+  const match = /^Bearer (ctc_[A-Za-z0-9]{40})$/i.exec(header);
+  if (!match && oauthEnabled(env)) {
+    // An OAuth access token or a dashboard key, both vouched for by ctc-auth: the bucket is the user. Each
+    // introspection cache miss costs ctc-auth a lookup, so misses are metered: per address, at the address's own
+    // minute rate, for credentials any string can reach; per user for a JWT, whose signature already held.
+    const spend = (limiter: RateLimit, key: string) => storage(() => limiter.limit({ key })).pipe(Effect.map(rate => rate.success));
+    const meters = { address: spend(env[QUOTAS[addressLimits].binding], `introspect:${address}`), user: (sub: string) => spend(env.RL_INTROSPECT, `u:${sub}`) };
+    return yield* identifyBearer(env, header, meters).pipe(
+      Effect.map((verdict): Credential => verdict.kind === 'user' ? { bucket: `u:${verdict.sub}` }
+        : verdict.kind === 'insufficient_scope' ? { status: 403, error: 'insufficient_scope' } : invalid),
+      Effect.catchTag('IntrospectionThrottled', () => Effect.succeed<Credential>({ status: 429, error: 'rate_limited' })),
+    );
+  }
+  if (!match || !match[1].startsWith('ctc_')) return invalid;
+  const record = yield* readKey(env, yield* hashKey(match[1]));
+  if (!record || record.status !== 'active') return invalid;
+  // Re-registering mints another key but no extra allowance. The bucket keeps the `k:` prefix: www accepts
+  // `k:` and `ip:` forwarded caller keys (`u:` once W1 ships).
+  return { bucket: `k:${yield* hashKey(record.email.trim().toLowerCase())}` };
+});
+/** The address bucket: an IPv4 address or an IPv6 /64. A published connector address keeps it as its bucket but
+ *  gets the connector limits, because many people share it. */
+const addressOf = (request: Request, connectors: readonly Cidr[]) => {
   const ip = request.headers.get('CF-Connecting-IP');
-  // The address bucket: an IPv4 address or an IPv6 /64. A published connector address keeps it as its
-  // bucket but gets the connector limits, because many people share it.
-  const address = anonymousBucket(ip);
+  return { address: anonymousBucket(ip), addressLimits: ip !== null && inRanges(ip, connectors) ? 'connector' as const : 'anonymous' as const };
+};
+export const authorise = Effect.fn('authorise')(function* (request: Request, env: Env, connectors: readonly Cidr[]): Effect.fn.Return<AuthDecision, StorageError | AuthUnavailable> {
+  const header = request.headers.get('Authorization');
+  const { address, addressLimits } = addressOf(request, connectors);
   const caller: Caller = header !== null
     ? { tier: 'registered', limits: 'registered', bucket: '' }
-    : { tier: 'anonymous', limits: ip !== null && inRanges(ip, connectors) ? 'connector' : 'anonymous', bucket: address };
+    : { tier: 'anonymous', limits: addressLimits, bucket: address };
   if (header !== null) {
-    const match = /^Bearer (ctc_[A-Za-z0-9]{40})$/i.exec(header);
-    if (!match || !match[1].startsWith('ctc_')) return { caller, status: 401, error: 'invalid_key' };
-    const hash = yield* hashKey(match[1]);
-    const record = yield* readKey(env, hash);
-    if (!record || record.status !== 'active') return { caller, status: 401, error: 'invalid_key' };
-    // The quota belongs to the person, not the key: re-registering mints another key but no extra allowance.
-    // The bucket keeps the `k:` prefix because www only accepts `k:` and `ip:` forwarded caller keys.
-    caller.bucket = `k:${yield* hashKey(record.email.trim().toLowerCase())}`;
+    const credential = yield* credentialBucket(env, header, address, addressLimits);
+    if ('status' in credential) return { caller, ...credential };
+    caller.bucket = credential.bucket;
   }
   // The limiter runs first because it is the cheaper check: a flood is cut off at the minute rate without a
   // KV read per request. The address deny entry also covers keyed callers.
@@ -84,4 +107,16 @@ export const authorise = Effect.fn('authorise')(function* (request: Request, env
   const deny = yield* denied(env, [caller.bucket, address]);
   if (deny === true) return { caller, status: 403, error: 'denied' };
   return deny === 'unknown' ? { caller, status: 200, denyListUnchecked: true } : { caller, status: 200 };
+});
+/** An admitted caller's credential, checked again once its upload has arrived, so a grant withdrawn or a key revoked
+ *  while the body came in is refused before any tool runs. Only the credential: the minute rate and the deny list
+ *  were settled on admission, and spending the rate again would charge the caller twice. A JWT's re-check is
+ *  normally an introspection cache hit. */
+export const recheck = Effect.fn('recheck')(function* (request: Request, env: Env, connectors: readonly Cidr[], admitted: AuthDecision): Effect.fn.Return<AuthDecision, StorageError | AuthUnavailable> {
+  const header = request.headers.get('Authorization');
+  if (header === null) return admitted;
+  const { address, addressLimits } = addressOf(request, connectors);
+  const credential = yield* credentialBucket(env, header, address, addressLimits);
+  if ('status' in credential) return { caller: admitted.caller, ...credential };
+  return credential.bucket === admitted.caller.bucket ? admitted : { caller: admitted.caller, ...invalid };
 });
