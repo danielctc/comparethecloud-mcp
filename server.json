@@ -3,9 +3,28 @@
   "name": "net.comparethecloud/mcp",
   "description": "Read-only UK technology provider directory, articles, news and opinion from Compare the Cloud.",
   "title": "Compare the Cloud",
-  "repository": { "url": "https://github.com/danielctc/comparethecloud-mcp", "source": "github" },
-  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/danielctc/comparethecloud-mcp",
+    "source": "github"
+  },
+  "version": "1.1.0",
   "websiteUrl": "https://mcp.comparethecloud.net",
-  "remotes": [{ "type": "streamable-http", "url": "https://mcp.comparethecloud.net/mcp",
-    "headers": [{ "name": "Authorization", "description": "Optional. 'Bearer <key>' from https://mcp.comparethecloud.net/register for the higher limit.", "isRequired": false, "isSecret": true }] }]
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.comparethecloud.net/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Optional. 'Bearer <key>' from https://mcp.comparethecloud.net/register for the higher limit.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    },
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.comparethecloud.net/auth/mcp"
+    }
+  ]
 }

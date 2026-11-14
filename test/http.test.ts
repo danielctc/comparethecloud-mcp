@@ -12,12 +12,21 @@ afterEach(() => vi.unstubAllGlobals());
 it('returns health, discovery and a JSON 404', async () => {
   const { env } = mockEnv();
   const health = await worker.fetch(request('/health'), env, createExecutionContext());
-  expect(await health.json()).toEqual({ ok: true, version: '1.0.0', upstream: env.SITE_ORIGIN });
+  expect(await health.json()).toEqual({ ok: true, version: '1.1.0', upstream: env.SITE_ORIGIN });
   expect(health.headers.get('Access-Control-Allow-Origin')).toBe('*');
   const card = await worker.fetch(request('/.well-known/mcp.json'), env, createExecutionContext());
   expect(await card.json()).toMatchObject({ endpoint: `${origin}/mcp`, transport: 'streamable-http', auth: 'optional bearer key', register: `${origin}/register` });
   const missing = await worker.fetch(request('/missing'), env, createExecutionContext());
   expect(missing.status).toBe(404); expect(await missing.json()).toEqual({ error: 'not_found' });
+});
+it('lists the signed-in endpoint in the MCP card only while OAuth is on', async () => {
+  const { env } = mockEnv();
+  const off = await (await worker.fetch(request('/.well-known/mcp.json'), env, createExecutionContext())).json() as Record<string, unknown>;
+  expect(off).not.toHaveProperty('signed_in_endpoint');
+  env.OAUTH_ENABLED = 'true';
+  const on = await (await worker.fetch(request('/.well-known/mcp.json'), env, createExecutionContext())).json();
+  expect(on).toMatchObject({ endpoint: `${origin}/mcp`, signed_in_endpoint: `${origin}/auth/mcp`, signed_in_auth: 'oauth',
+    oauth_protected_resource: `${origin}/.well-known/oauth-protected-resource/auth/mcp` });
 });
 it.each(['/mcp', '/health'])('handles CORS preflight on %s without consuming a bucket', async path => {
   const { env } = mockEnv();
