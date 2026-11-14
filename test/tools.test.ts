@@ -28,7 +28,7 @@ it.each(Object.keys(fixtures) as ToolName[])('%s returns structured content and 
   expect(response.structuredContent).toBeDefined(); expect(fetch).toHaveBeenCalledTimes(name === 'search' ? 2 : 1);
   const [url, init] = fetch.mock.calls[0] as unknown as [URL, RequestInit];
   expect(url.origin).toBe('https://www.comparethecloud.net');
-  expect(init.headers).toMatchObject({ 'X-CTC-Upstream-Secret': 'test-upstream-token', 'X-CTC-RL-Key': 'ip:192.0.2.1', 'User-Agent': 'ctc-mcp/1.0.0 (+https://mcp.comparethecloud.net)' });
+  expect(init.headers).toMatchObject({ 'X-CTC-Upstream-Secret': 'test-upstream-token', 'X-CTC-RL-Key': 'ip:192.0.2.1', 'User-Agent': 'ctc-mcp/1.1.0 (+https://mcp.comparethecloud.net)' });
   expect(init.signal).toBeInstanceOf(AbortSignal); expect(init.redirect).toBe('manual');
 });
 it('serves GETs from the edge cache and stores only decoded successes there', async () => {

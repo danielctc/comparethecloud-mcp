@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "comparethecloud",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Find technology providers and read Compare the Cloud editorial content.",
   "author": {
     "name": "Compare the Cloud",

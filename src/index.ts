@@ -75,6 +75,10 @@ const wellKnown = (path: string, method: string, env: Env): Response | null => {
     endpoint: `${env.PUBLIC_ORIGIN}/mcp`, transport: 'streamable-http', auth: 'optional bearer key',
     register: `${env.PUBLIC_ORIGIN}/register`, docs: 'https://github.com/danielctc/comparethecloud-mcp',
     privacy: `${SITE_URL}/privacy-policy`, contact: `${SITE_URL}/contact`,
+    ...(oauthEnabled(env) ? {
+      signed_in_endpoint: `${env.PUBLIC_ORIGIN}${RESOURCE_PATH}`, signed_in_auth: 'oauth',
+      oauth_protected_resource: metadataUrl(env),
+    } : {}),
   });
   if (path === '/.well-known/openai-apps-challenge' && (method === 'GET' || method === 'HEAD')) {
     // The portal's domain check: the exact token as plain text, never cached, so a rotated secret shows at once.

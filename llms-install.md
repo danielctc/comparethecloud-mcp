@@ -22,6 +22,18 @@ Anonymous callers get 60 requests per minute per IP. A free key gives 600 per mi
 
 Responses: HTTP 401 means the key is invalid or revoked. HTTP 429 means rate-limited; wait 60 seconds (`Retry-After: 60`).
 
+## Signed-in alternative
+
+If the user has a Compare the Cloud account and would rather sign in than handle a key, use `https://mcp.comparethecloud.net/auth/mcp` instead of `/mcp`. Same tools, same 600 requests per minute as a free key.
+
+- The client opens a browser on first connect. The user signs in at `auth.comparethecloud.net` and chooses Allow or Deny. You never see or store a credential.
+- Claude Code: `claude mcp add --transport http comparethecloud https://mcp.comparethecloud.net/auth/mcp`, then run `/mcp` and pick `comparethecloud` to sign in.
+- Cursor and Cline: the same server entries as below, with the `/auth/mcp` URL and no `headers` block.
+- Without a credential, `/auth/mcp` answers HTTP 401 with a `WWW-Authenticate` header that points the client at the sign-in. That is expected, not an error.
+- The user can disconnect any app at https://my.comparethecloud.net.
+
+Add only one of the two endpoints. Adding both gives the user every tool twice.
+
 ## Cline
 
 Open the MCP Servers view, choose **Configure**, then **Configure MCP Servers**. This opens `cline_mcp_settings.json`. Add the server under `mcpServers`:

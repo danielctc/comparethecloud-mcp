@@ -1,6 +1,6 @@
 {
   "name": "comparethecloud",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Compare the Cloud: UK B2B technology provider directory (20,000+ listings) plus articles, news and expert opinion. Read-only.",
   "contextFileName": "GEMINI.md",
   "mcpServers": {
