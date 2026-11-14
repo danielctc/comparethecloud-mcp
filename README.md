@@ -76,6 +76,35 @@ hosted endpoint.
 npx mcp-remote https://mcp.comparethecloud.net/mcp
 ```
 
+## Signed-in access
+
+There are two endpoints, and both serve the same tools.
+
+| Endpoint | Sign-in | Use it for |
+|---|---|---|
+| `https://mcp.comparethecloud.net/mcp` | None. An optional free `ctc_` key raises the rate limit from 60 to 600 requests per minute. | Scripts, quick tests and any client where you would rather paste a key than sign in. |
+| `https://mcp.comparethecloud.net/auth/mcp` | OAuth through `auth.comparethecloud.net`, with a Compare the Cloud account. | An assistant you use as yourself. There is no key to store, and you can disconnect it later. |
+
+A signed-in connection gets the same limits as a free key: 600 requests per minute and the keyed daily limits below. `/auth/mcp` never answers without a credential; a request with none gets a `401` that points the client at the sign-in. Emailed `ctc_` keys also work on `/auth/mcp`.
+
+When a client connects, it opens a browser. Sign in with your Compare the Cloud account, then choose Allow or Deny on the consent page. The client keeps the token and refreshes it for you.
+
+### Claude Code (signed in)
+
+```sh
+claude mcp add --transport http ctc https://mcp.comparethecloud.net/auth/mcp
+```
+
+Then run `/mcp` inside Claude Code, choose `ctc` and follow the browser prompt.
+
+### Cursor (signed in)
+
+Open Settings → MCP → Add server and enter `https://mcp.comparethecloud.net/auth/mcp` as the URL. Cursor opens the browser to sign in the first time it connects.
+
+### Disconnecting
+
+Every connected app is listed at [my.comparethecloud.net](https://my.comparethecloud.net), and you can disconnect each one separately. The app loses access within about a minute.
+
 ## Tools
 
 | Tool | Purpose | Inputs |
