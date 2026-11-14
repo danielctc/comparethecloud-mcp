@@ -217,7 +217,7 @@ export default {
     if (path === '/health' && request.method === 'GET') {
       return Response.json({ ok: true, version, upstream: env.SITE_ORIGIN }, { headers: cors });
     }
-    if (path === '/' && request.method === 'GET') return html(landing(env.PUBLIC_ORIGIN));
+    if (path === '/' && request.method === 'GET') return html(landing(env.PUBLIC_ORIGIN, oauthEnabled(env)));
     if (path === '/register' && request.method === 'GET') return html(registrationForm());
     if (path === '/register' && request.method === 'POST') {
       const outcome = await Effect.runPromise(registerSafely(request, env));

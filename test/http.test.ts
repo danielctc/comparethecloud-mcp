@@ -71,6 +71,17 @@ it('serves mobile-safe landing and registration HTML with security headers', asy
   expect(await form.text()).toContain('<form method="post"'); expect(form.headers.get('Cache-Control')).toBe('no-store');
 });
 
+it('shows the signed-in endpoint on the landing page only while OAuth is on', async () => {
+  const { env } = mockEnv();
+  const off = await (await worker.fetch(request('/'), env, createExecutionContext())).text();
+  expect(off).not.toContain('/auth/mcp');
+  env.OAUTH_ENABLED = 'true';
+  const on = await (await worker.fetch(request('/'), env, createExecutionContext())).text();
+  expect(on).toContain(`${origin}/auth/mcp`); expect(on).toContain('Signed-in access');
+  expect(on).toContain('claude mcp add --transport http ctc'); expect(on).toContain('my.comparethecloud.net');
+  expect(on).toContain(`<code>${origin}/mcp</code>`);
+});
+
 it('serves only the exact OpenAI challenge token when configured', async () => {
   const { env } = mockEnv();
   const path = '/.well-known/openai-apps-challenge';
