@@ -230,7 +230,7 @@ export default {
     }
     const discovery = wellKnown(path, request.method, env);
     if (discovery) return discovery;
-    if (['/logo.png', '/logo-512.png', '/logo-400.png', '/favicon.ico', '/apple-touch-icon.png'].includes(path) && request.method === 'GET') return env.ASSETS.fetch(request);
+    if (['/logo.png', '/logo-512.png', '/logo-400.png', '/favicon.ico', '/apple-touch-icon.png', '/walkthrough.mp4'].includes(path) && request.method === 'GET') return env.ASSETS.fetch(request);
     return apiError(404, 'not_found', {});
   },
 } satisfies ExportedHandler<Env>;
