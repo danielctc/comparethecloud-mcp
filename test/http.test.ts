@@ -12,7 +12,7 @@ afterEach(() => vi.unstubAllGlobals());
 it('returns health, discovery and a JSON 404', async () => {
   const { env } = mockEnv();
   const health = await worker.fetch(request('/health'), env, createExecutionContext());
-  expect(await health.json()).toEqual({ ok: true, version: '1.1.1', upstream: env.SITE_ORIGIN });
+  expect(await health.json()).toEqual({ ok: true, version: '1.1.2', upstream: env.SITE_ORIGIN });
   expect(health.headers.get('Access-Control-Allow-Origin')).toBe('*');
   const card = await worker.fetch(request('/.well-known/mcp.json'), env, createExecutionContext());
   expect(await card.json()).toMatchObject({ endpoint: `${origin}/mcp`, transport: 'streamable-http', auth: 'optional bearer key', register: `${origin}/register` });
