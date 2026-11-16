@@ -10,7 +10,7 @@
   "version": "1.1.1",
   "websiteUrl": "https://mcp.comparethecloud.net",
   "icons": [
-    { "src": "https://mcp.comparethecloud.net/logo-512.png", "mimeType": "image/png", "sizes": ["512x512"] }
+    { "src": "https://raw.githubusercontent.com/danielctc/comparethecloud-mcp/main/public/logo-512.png", "mimeType": "image/png", "sizes": ["512x512"] }
   ],
   "remotes": [
     {
