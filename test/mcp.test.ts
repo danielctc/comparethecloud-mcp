@@ -80,3 +80,18 @@ it('advertises company knowledge input and output schemas and read-only annotati
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
   }
 });
+
+const LOGO = 'https://mcp.comparethecloud.net/logo-512.png';
+it('names its logo on the server and on every tool so clients can draw it', async () => {
+  const init = await call('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+  expect(init.data.result.serverInfo.icons).toEqual([{ src: LOGO, mimeType: 'image/png', sizes: ['512x512'] }]);
+  const list = await call('tools/list');
+  for (const tool of list.data.result.tools) expect(tool.icons, tool.name).toEqual([{ src: LOGO, mimeType: 'image/png', sizes: ['512x512'] }]);
+});
+it('serves the logo as /favicon.ico and /apple-touch-icon.png for clients that guess the icon path', async () => {
+  const { env } = mockEnv();
+  for (const path of ['/favicon.ico', '/apple-touch-icon.png']) {
+    const response = await worker.fetch(new Request('https://mcp.comparethecloud.net' + path), env, createExecutionContext());
+    expect(response.status, path).toBe(200);
+  }
+});
