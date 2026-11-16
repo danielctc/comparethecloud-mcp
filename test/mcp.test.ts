@@ -90,7 +90,7 @@ it('names its logo on the server and on every tool so clients can draw it', asyn
 });
 it('serves the logo as /favicon.ico and /apple-touch-icon.png for clients that guess the icon path', async () => {
   const { env } = mockEnv();
-  for (const path of ['/favicon.ico', '/apple-touch-icon.png']) {
+  for (const path of ['/favicon.ico', '/apple-touch-icon.png', '/walkthrough.mp4']) {
     const response = await worker.fetch(new Request('https://mcp.comparethecloud.net' + path), env, createExecutionContext());
     expect(response.status, path).toBe(200);
   }
