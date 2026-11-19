@@ -32,5 +32,8 @@
     "typescript": "latest",
     "vitest": "^4.1.0",
     "wrangler": "latest"
+  },
+  "overrides": {
+    "vite": "^8.3.8"
   }
 }
