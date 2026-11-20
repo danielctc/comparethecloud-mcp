@@ -31,6 +31,9 @@
     "oxlint": "latest",
     "typescript": "latest",
     "vitest": "^4.1.0",
-    "wrangler": "latest"
+    "wrangler": "^4.165.0"
+  },
+  "overrides": {
+    "vite": "^8.3.8"
   }
 }
